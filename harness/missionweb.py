@@ -1591,15 +1591,34 @@ class MissionService:
                 subscription_only=bool(overnight),
                 allowed_executors=allowed_executors)
             from .router import resolve_run_decision
-            brain = resolve_run_decision(
-                goal, provider="auto", model=requested_model,
-                route_kind="code" if code else "chat", purpose="mission",
-                intent="build" if code else "plan",
-                trusted_profile=routing_context.trusted_profile,
-                routing_context=routing_context)
-            provider, model = brain.provider, brain.model
-            case["brain_route"] = brain.to_dict()
-            if str(case["brain_route"].get("executor") or "") == "codex-exec":
+            try:
+                brain = resolve_run_decision(
+                    goal, provider="auto", model=requested_model,
+                    route_kind="code" if code else "chat", purpose="mission",
+                    intent="build" if code else "plan",
+                    trusted_profile=routing_context.trusted_profile,
+                    routing_context=routing_context)
+            except ValueError as exc:
+                # Creating and inspecting an ordinary Mission is a durable state
+                # operation, not a model call.  A fresh installation must therefore
+                # be able to queue work before a provider is connected.  Code and
+                # overnight Missions are different: they freeze execution authority
+                # up front, so those requests still fail closed without a route.
+                if code or not str(exc).startswith(
+                        "Auto found no currently authenticated model"):
+                    raise
+                brain = None
+            if brain is None:
+                case["brain_route_pending"] = {
+                    "requested_provider": "auto",
+                    "requested_model": str(requested_model or ""),
+                    "reason": "connect a model provider before running this Mission",
+                }
+            else:
+                provider, model = brain.provider, brain.model
+                case["brain_route"] = brain.to_dict()
+            if brain is not None and str(
+                    case["brain_route"].get("executor") or "") == "codex-exec":
                 case["brain_route"]["requested_executor"] = "codex-exec"
                 case["brain_route"]["executor"] = "collie"
                 case["brain_route"]["worker_executor"] = "collie"
@@ -1608,12 +1627,13 @@ class MissionService:
                      "using native Collie transport" if not code else
                      "codex-exec declined: opaque CLI requests cannot satisfy the "
                      "Mission's hard model-call/token/cost leash; using native Collie code"))
-            case["brain_route"]["durable_fallback_policy"] = (
-                "route is frozen for this Mission; fallback requires an explicit successor")
+            if brain is not None:
+                case["brain_route"]["durable_fallback_policy"] = (
+                    "route is frozen for this Mission; fallback requires an explicit successor")
             # Non-code Missions also need a per-Mission frozen route.  Without
             # this profile, a long-lived daemon would try make_provider('auto')
             # or reuse whichever provider a different Mission activated last.
-            if not code:
+            if not code and brain is not None:
                 case["execution_profile"] = _execution_profile(
                     provider, model, overnight=False,
                     runner=str(case["brain_route"].get("executor") or "collie"))

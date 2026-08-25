@@ -61,7 +61,8 @@ def main():
     check(not settings.pinned("PROVIDER"), "with no env var, PROVIDER is not pinned")
     ids = {e["id"] for e in catalog.list_entries()}
     check("mock:mock" not in ids, "mock is not offered in the catalog (%d entries)" % len(ids))
-    check(any(i.startswith("anthropic-oauth:") for i in ids), "real providers are still listed")
+    check(any(i.startswith(("claude-agent-sdk:", "codex-oauth:", "anthropic:"))
+              for i in ids), "real providers are still listed")
     _restore(old)
 
     # 2. pinned to mock: the picker must admit it cannot change anything...

@@ -31,7 +31,12 @@ check("unsupported Claude direct is absent", all(
     e["provider"] != "anthropic-oauth" for e in ents))
 check("Agent SDK Opus 5 present", "claude-agent-sdk:claude-opus-5" in by_id)
 check("Claude Code Opus 5 present", "claude-cli:opus" in by_id)
-check("Claude Code Sonnet 5 present", "claude-cli:sonnet" in by_id)
+# An unauthenticated provider deliberately contributes one grey "get started"
+# row to the picker rather than every model it could eventually run.  Verify the
+# curated capability at its source so this check is independent of the runner's
+# installed CLIs and login state.
+static_ids = {entry.id for entry in catalog._static()}
+check("Claude Code Sonnet 5 curated", "claude-cli:sonnet" in static_ids)
 
 # ---- dedup: no duplicate ids ---------------------------------------------------------
 ids = [e["id"] for e in ents]

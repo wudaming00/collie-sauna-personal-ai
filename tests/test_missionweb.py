@@ -175,6 +175,20 @@ def test_read_surfaces_do_not_require_a_provider():
     svc.close()
 
 
+def test_fresh_install_can_queue_before_connecting_a_provider():
+    print("test_fresh_install_can_queue_before_connecting_a_provider")
+    fd, p = tempfile.mkstemp(suffix=".db"); os.close(fd)
+    unavailable = ValueError(
+        "Auto found no currently authenticated model; connect a provider or choose one explicitly")
+    with patch("harness.router.resolve_run_decision", side_effect=unavailable):
+        svc = MissionService(base=p, provider="auto")
+        st = svc.start("persist before setup", autonomous=False)
+    pending = st.get("case", {}).get("brain_route_pending", {})
+    check(st["state"] == QUEUED and pending.get("requested_provider") == "auto",
+          "a fresh install queues ordinary work and records that its route is pending")
+    svc.close()
+
+
 def test_human_assist_can_continue_without_ending_the_mission():
     print("test_human_assist_can_continue_without_ending_the_mission")
     svc = _svc([H, {"action": "done", "reason": "finished after MFA"}])
@@ -954,6 +968,7 @@ def main():
     test_pause_resume_check_and_cancel()
     test_wrong_mission_nonce_and_cancelled_nonce_are_refused()
     test_read_surfaces_do_not_require_a_provider()
+    test_fresh_install_can_queue_before_connecting_a_provider()
     test_human_assist_can_continue_without_ending_the_mission()
     test_mock_provider_never_fakes_durable_progress()
     test_refused_parked_action_does_not_deadlock_the_mission()
