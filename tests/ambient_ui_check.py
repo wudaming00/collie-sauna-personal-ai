@@ -24,6 +24,26 @@ TOKEN = os.environ.get("COLLIE_TOKEN", "")
 RESULTS = []
 SHOTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_scratch_shots")
 
+WEATHER_FIXTURE = {
+    "ok": True,
+    "city": "Testville",
+    "region": "California",
+    "country_code": "US",
+    "timezone": "America/Los_Angeles",
+    "observed_at": "2026-08-25T12:00",
+    "temp_c": 21,
+    "feels_c": 21,
+    "humidity": 48,
+    "precip_mm": 0,
+    "wind_kph": 7,
+    "wind_deg": 270,
+    "is_day": 1,
+    "code": 1,
+    "hourly": [],
+    "daily": [],
+    "source": "Open-Meteo",
+}
+
 
 def check(name, condition, detail=""):
     ok = bool(condition)
@@ -48,6 +68,18 @@ def shot(page, name):
         pass
 
 
+def stub_weather(page):
+    """Keep the UI gate independent of public geo/weather availability.
+
+    desktop.weather has its own response-shaping tests.  This suite verifies how
+    the browser renders that response, so reaching ipapi/Open-Meteo here only
+    made a deterministic layout check depend on the runner's outbound network.
+    """
+    body = json.dumps(WEATHER_FIXTURE)
+    page.route("**/api/desktop/weather*", lambda route: route.fulfill(
+        status=200, content_type="application/json", body=body))
+
+
 def main():
     from playwright.sync_api import sync_playwright
 
@@ -69,6 +101,7 @@ def main():
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 900})
+        stub_weather(page)
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append("console.error: " + m.text) if m.type == "error" else None)
@@ -461,6 +494,7 @@ def main():
         # The owner's primary locale in the reference surface is Chinese. Long translated labels
         # have to fit the same quiet geometry; checking only English misses the real compact view.
         zh = browser.new_page(viewport={"width": 1440, "height": 900}, locale="zh-CN")
+        stub_weather(zh)
         zh.goto(WEB + "/ambient", wait_until="load")
         zh.wait_for_selector(".lead .h", timeout=10000)
         labels = zh.evaluate("() => Array.from(document.querySelectorAll('.ambient-anchor .node-kind'))"
@@ -484,6 +518,7 @@ def main():
         # The actual compact desktop crop must stay composed: focus, horizon and anchors remain in
         # separate bands, and every anchor stays inside the field instead of colliding with time.
         compact = browser.new_page(viewport={"width": 874, "height": 902}, locale="zh-CN")
+        stub_weather(compact)
         compact.goto(WEB + "/ambient", wait_until="load")
         compact.wait_for_selector(".lead .h", timeout=10000)
         rail_inside = compact.evaluate("() => { var f=document.querySelector('#wField').getBoundingClientRect();"
