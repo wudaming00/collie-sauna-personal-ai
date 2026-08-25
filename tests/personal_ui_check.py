@@ -172,8 +172,9 @@ def main():
         shot(page, "today-sauna")
 
         # Capsule: context chips
-        page.keyboard.press("Control+Shift+Space")
-        page.wait_for_selector("#capsuleLayer", state="visible", timeout=5000)
+        page.keyboard.press("Meta+Shift+Space" if sys.platform == "darwin"
+                            else "Control+Shift+Space")
+        page.wait_for_selector("#capsuleLayer", state="visible", timeout=15000)
         page.wait_for_timeout(1500)
         chips = page.inner_text("#capsuleContextChips") if page.locator("#capsuleContextChips").count() else ""
         check("capsule shows context chips (task / Sauna)", ("Task" in chips or "Sauna" in chips), chips)

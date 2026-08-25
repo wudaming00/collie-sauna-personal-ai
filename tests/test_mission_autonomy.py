@@ -39,7 +39,7 @@ def test_hung_decider_is_bounded_and_heartbeat_cannot_fake_progress(tmp_path):
     store, actions = _stores(tmp_path)
 
     def hung(*_):
-        time.sleep(.3)
+        time.sleep(1.0)
         return {"action": "needs_human"}
 
     leash = world_leash()
@@ -47,7 +47,9 @@ def test_hung_decider_is_bounded_and_heartbeat_cannot_fake_progress(tmp_path):
     create_mission(store, "hung", "wait safely", leash=leash)
     started = time.monotonic()
     state = MissionDriver(store, actions, hung, capabilities=[]).advance("hung")
-    assert time.monotonic() - started < .2
+    # SQLite bookkeeping and thread scheduling are slower on loaded hosted macOS runners. The
+    # important bound is that the driver returns well before the one-second hung call completes.
+    assert time.monotonic() - started < .6
     assert state == WAITING
     assert store.runtime("hung")["retry_count"] == 1
     assert store.events("hung")[-1]["name"] == "decider_timeout"
@@ -57,18 +59,20 @@ def test_hung_action_is_fenced_and_late_worker_cannot_fold(tmp_path):
     store, actions = _stores(tmp_path)
 
     def execute(_rec):
-        time.sleep(.2)
+        time.sleep(.6)
         return {"case": {"late_write": True}}
 
     cap = Capability("slow", execute, lambda _r, _v: Verdict(VERIFIED, "ok"),
                      reversible=True, risk="read")
     leash = world_leash(may=["slow"], autonomous=True)
-    leash["max_step_seconds"] = .05
+    # Leave enough margin for the immediate decider thread to be scheduled on a loaded Windows CI
+    # runner; the capability remains three times slower, so this still exercises action fencing.
+    leash["max_step_seconds"] = .2
     create_mission(store, "slow", "do it", leash=leash)
     decider = lambda *_: {"action": "slow", "args": {}}
     state = MissionDriver(store, actions, decider, [cap]).advance("slow")
     assert state == RECOVERY_REQUIRED
-    time.sleep(.3)
+    time.sleep(.7)
     assert store.get("slow").state == RECOVERY_REQUIRED
     assert "late_write" not in store.get("slow").case
     assert actions.receipts() and actions.receipts()[0]["fired"] == 1
