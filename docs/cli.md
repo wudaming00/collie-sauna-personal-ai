@@ -1,0 +1,129 @@
+# CLI reference
+
+`collie <command> [options]`. Bare `collie` opens the default chat surface and runs first-time
+onboarding when nothing is configured. Full help for any command: `collie <command> --help`.
+
+## Everyday
+
+| Command | What it does |
+|---|---|
+| `collie` | Terminal chat (TUI). First run picks a provider. |
+| `collie -p "<task>"` / `collie run "<task>"` | Run one task headlessly. |
+| `collie web` | Serve the browser GUI — streams the verification gate live. First run offers a companion display name; rename later under **Settings → My Collie**. |
+| `collie web --name Rowan` | Legacy compatibility: attach the kennel/workspace alias `Rowan` to the web context. It does not rename the computer-bound Collie; use **Settings → My Collie** for the one canonical display name. |
+| `collie web --lan` | Refused by design. A one-shot pairing exchange cannot protect the reusable control token on later plain-HTTP LAN requests. Use `collie web --remote`, whose relay transport is TLS plus end-to-end encryption. |
+| `collie app` | Open the native desktop window (Windows). |
+| `collie command` | Start the hidden global command capsule (Windows); Ctrl+Shift+Space opens/listens. |
+| `collie tui` | Rich terminal chat with a live tool/gate/diff timeline. |
+| `collie repl` | Interactive REPL that keeps the conversation thread. |
+
+## Personal state
+
+Local, structured, no account. See **[SAUNA_VISION.md](SAUNA_VISION.md)** for why these are native
+primitives rather than integrations.
+
+| Command | What it does |
+|---|---|
+| `collie today ["<focus>"]` | The executive view: upcoming events with their meaning, goals with progress, tasks, suggestions, recent activity. `--json` for the whole brief. |
+| `collie note "<text>"` | Save a note. `--append-to "<title>"` adds to an existing one, `--project` / `--goal` relate it, `--decision` also records it in long-term memory. |
+| `collie task ls \| add \| done \| focus \| drop` | Tasks by goal. `done` moves the goal, the event's preparation and the journal, and prints the next likely step. `focus` makes runs count toward that task. |
+| `collie journal [YYYY-MM-DD]` | The AI-maintained day entry. `--build` recompresses it from activity, `--week` adds the weekly roll-up. |
+| `collie state render \| path \| activity \| learn` | Regenerate the Markdown projections, show the store path, print the activity ledger, relearn workflows from history. |
+| `collie state seed-demo \| reset-demo` | The `docs/DEMO.md` scenario. `reset-demo` removes exactly what was seeded. |
+| `collie sauna status \| connect \| disconnect \| sync \| context \| devices \| handoff \| export \| restore \| route` | The person-level layer. `context` prints the block that would enter the prompt; `restore` is the "welcome back" path onto a new device. Cloud execution is mocked in this prototype and says so. |
+
+## Running work
+
+| Command | What it does |
+|---|---|
+| `collie run "<task>" --json` | Final result object (tokens, cost, verified). |
+| `collie run "<task>" --stream-json` | Live NDJSON: tool · edit · repro-gate · receipt. |
+| `collie loop --goal "<g>" --until "<shell>"` | Iterate toward a goal; stop when the check exits 0. |
+| `collie pack "<task>" -n 3 --check "<shell>" --apply` | Best-of-N; keep only what passes. |
+| `collie selftest` | $0 deterministic end-to-end (mock model, real tools). |
+
+## Setup & configuration
+
+| Command | What it does |
+|---|---|
+| `collie setup` | Install optional deps, pick a provider, pre-download the memory model. |
+| `collie setup --check` | Diagnose only; install nothing. |
+| `collie init` | Warm the memory model + validate the codemap for this repo. |
+| `collie init --rules` | Additionally have the model write an `AGENTS.md`. |
+| `collie config` | List every setting and its effective value. |
+| `collie config KEY` | Print one setting. |
+| `collie config KEY VALUE` | Set one setting (e.g. `collie config LANG zh-tw`). |
+| `collie mem prefer quality=thorough` | Save one explicit, scoped owner preference. |
+| `collie mem profile` | Show only confirmed/verified preference and habit memory used by policy. |
+| `collie mcp list \| login \| logout \| tools` | Manage MCP servers. |
+| `collie library scaffold \| list \| show \| validate \| plan` | Create a safe starter, inspect installed extensions, or review a local package and its exact digest/scopes. |
+| `collie library install \| enable \| disable \| rollback \| uninstall` | Operate the trusted extension lifecycle; activation and removal have explicit review boundaries. |
+| `collie library revoke <id> --digest <sha256> --reason "…" --yes` | Revoke one exact installed digest; active matching code is disabled fail-closed. |
+| `collie library connections \| audit` | List active data-only connection descriptors or inspect lifecycle audit records. |
+
+## Desktop (Windows)
+
+| Command | What it does |
+|---|---|
+| `collie command --install` | Keep the Ctrl+Shift+Space voice/outcome capsule ready at logon. |
+| `collie command --stop` / `--uninstall` | Stop it / remove its autostart without touching the app or wallpaper. |
+| `collie wallpaper --install` | Live desktop star-map behind your icons; starts at logon. |
+| `collie wallpaper --stop` / `--uninstall` | Stop it / remove the autostart. |
+| `collie browser-bridge` | Run the bridge the browser extension polls (the `browser_*` tools). |
+| `collie browser-bridge --install` | Start the bridge at logon. |
+
+See [The desktop app](desktop.md) for what these do and how they fit together.
+
+## Benchmark lab & delegation
+
+| Command | What it does |
+|---|---|
+| `collie compare` / `collie harnesses` | Run and compare harnesses on the same task. |
+| `collie dashboard` | Open the results dashboard. |
+| `collie prefix` | Measure the real prefix token cost on a provider. |
+| `collie mem` | Inspect / manage the memory store. |
+| `collie jobs ls \| inbox \| run \| confirm \| receipts` | Delegated work. |
+| `collie mission start "<goal>"` | Persist a durable campaign and return its ID immediately. |
+| `collie mission start "<goal>" --domains x.com,*.y.com --actions-per-hour 6` | Start with the saved Mission autonomy mode and named, paced boundaries. `--review` asks before irreversible actions; legacy `--auto` explicitly selects Hands-off. Also supports `--max-actions` and `--max-steps`. |
+| `collie mission start "<goal>" --code --workspace PATH --overnight --provider claude-agent-sdk --model claude-opus-4-8 --no-paid-overage --verify-command "python -m pytest -q"` | Start Collie's bounded native Opus route through the official Claude Agent SDK. Startup first runs an isolated SDK inference probe and fails closed if the subscription route is unavailable. |
+| `collie mission ls \| status \| run \| pause \| resume \| cancel \| confirm \| continue \| accept \| check \| reconcile` | Inspect, gate, and control durable campaigns. |
+| `collie jobs daemon` | Foreground wake loop for Jobs/Missions; catches up after sleep. `collie supervisor install` keeps it available after sign-in/reboot. |
+| `collie activity [--health]` | One durable view of foreground runs, Missions, specialists, automations, recovery, and worker health. |
+| `collie recovery ls \| show \| reconcile` | Inspect crash-uncertain tool boundaries; reconciliation always requires an explicit resolution and `--yes`. |
+| `collie hooks status \| check \| trust \| untrust` | Review deterministic hooks and trust only the exact configuration hash. |
+| `collie supervisor install \| status \| uninstall` | Manage the per-user Windows 24×7 worker supervisor. |
+| `collie automations upsert \| list \| status \| tick \| daemon` | Manage durable timer/file/page/webhook automation execution. |
+| `collie acp` | Run as an ACP agent over stdio (Zed / JetBrains / neovim). |
+
+Overnight code always requires an existing workspace. `--verify-command` can be
+omitted only when Collie detects a project check; startup fails if no check is
+available or the baseline snapshot is incomplete. Per-Mission `--provider` and
+`--model` freeze the SDK route without changing global Settings. Native
+overnight currently requires `claude-agent-sdk` and an explicit model such as
+`claude-opus-4-8`; Codex OAuth is not an overnight route.
+`--no-paid-overage` records the
+user's provider-side attestation. Collie invokes Anthropic's official Claude Agent
+SDK directly—not `claude -p` and not a raw OAuth Messages call—with Collie's custom
+replacement system prompt. `setting_sources=[]`; SDK built-in tools, skills,
+plugins, agents, slash commands, MCP servers, and fallback model are disabled. The
+worker environment excludes API keys and routing/proxy overrides, and there is no
+API-key, paid-credit, provider, or model fallback. Hitting a plan limit waits or
+asks for the user; it never buys, reloads, or switches to metered billing
+automatically.
+
+The route accepts an eligible signed-in Pro/Max plan (live-tested on Max) and remains subject to its
+limits. Current validation is a short end-to-end test, not a 12-hour soak. The
+12-active-hour Mission leash is a maximum authority envelope, not a promise of
+unlimited use, a completed overnight endurance result, or a guarantee that future
+provider policy will remain unchanged.
+
+## Configuration precedence
+
+`COLLIE_<KEY>` environment variable → `~/.collie/settings.json` (the Settings panel /
+`collie config`) → built-in default. A hard-set env var always wins. A token/cost budget
+(`COLLIE_MAX_COST` / `COLLIE_MAX_TOTAL_TOKENS`) stops a run at a ceiling.
+
+For first-party identity, explicit `collie web --name` → hard-set `COLLIE_COMPANION_NAME` → saved
+`COMPANION_NAME` → a single kennel dog → generic `Collie`. The saved name is display-only across
+Home, Mobile, Remote, and Ambient; Slack apps, `@` handles, and dog-mail addresses keep their own
+external identities until renamed through those systems' workflows.

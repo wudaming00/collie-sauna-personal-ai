@@ -1,0 +1,197 @@
+"""A face per dog (harness/avatar.py).
+
+The premise is identity, so the test that matters most is not "does it draw" but "does the SAME
+name give the SAME face" — a dog whose avatar changes on reinstall is worse than one with no
+avatar. The rest pins the two claims the design rests on: the eyes really are the pair of fills
+this recolours, and geometry is never touched.
+
+    python3 tests/test_avatar.py
+"""
+import os
+import re
+import struct
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+fails = []
+KENNEL = ["Rowan", "Meg", "Bracken", "Nell", "Fly", "Tess", "Moss", "Gwen",
+          "Cap", "Jess", "Pip", "Skye", "Roy", "Bess", "Glen", "Juno"]
+
+
+def check(ok, what):
+    print(("  PASS " if ok else "  FAIL ") + what)
+    if not ok:
+        fails.append(what)
+
+
+def png_pixels(data):
+    """Decode our own RGB/RGBA PNG — the encoder is ours, so nothing else would."""
+    import zlib
+    w, h, depth, ctype = struct.unpack(">IIBB", data[16:26])
+    idat = b""
+    i = 8
+    while i < len(data):
+        n = struct.unpack(">I", data[i:i + 4])[0]
+        tag = data[i + 4:i + 8]
+        if tag == b"IDAT":
+            idat += data[i + 8:i + 8 + n]
+        i += 12 + n
+    raw = zlib.decompress(idat)
+    channels = 4 if ctype == 6 else 3
+    stride = w * channels
+    rows = []
+    for y in range(h):
+        off = y * (stride + 1)
+        assert raw[off] == 0, "only filter 0 is written"
+        r = raw[off + 1:off + 1 + stride]
+        rows.append([tuple(r[x * channels:x * channels + channels]) for x in range(w)])
+    return w, h, rows
+
+
+def main():
+    from harness import avatar
+
+    # --- the whole premise ---------------------------------------------------------------------
+    def face(n):
+        # everything except `name`, which echoes what was passed in for display
+        return {k: v for k, v in avatar.traits(n).items() if k != "name"}
+
+    check(avatar.traits("Rowan") == avatar.traits("Rowan"), "the same name gives the same traits")
+    check(face("Rowan") == face("  rowan  "),
+          "the FACE is insensitive to case and stray spacing, so a name typed twice is one dog")
+    check(avatar.traits("  rowan  ")["name"] == "  rowan  ",
+          "...while the name itself is echoed as given, for display")
+    check(avatar.png("Rowan", 64) == avatar.png("Rowan", 64),
+          "the same name gives byte-identical PNGs — a face must survive a reinstall")
+    check(avatar.traits("Rowan") != avatar.traits("Meg"), "different names differ")
+
+    # Two axes, 8 coats x 24 plate offsets. Distinctness is NOT guaranteed — that is the birthday
+    # problem, and de-duplicating against the other dogs on this machine would make a dog's face
+    # change when it moved machine. So this asserts the range is being used, not that it is lucky.
+    seen = {(t["coat"], t["plate_hex"]) for t in (avatar.traits(n) for n in KENNEL)}
+    check(len(seen) >= len(KENNEL) - 2,
+          "the kennel spreads across the range (%d distinct of %d names)" % (len(seen), len(KENNEL)))
+    # The declared range must be the REAL range. Hue is taken mod 1, so an offset table that runs
+    # past a full turn silently folds onto itself — which it did, costing 17% with no symptom.
+    want = len(avatar.COATS) * len(avatar.PLATE_OFFSETS)
+    wide = {(t["coat"], t["plate_hex"]) for t in
+            (avatar.traits("dog%d" % i) for i in range(20000))}
+    check(len(wide) == want,
+          "every coat x offset is a distinct face: %d of a declared %d" % (len(wide), want))
+
+    # The name for a plate has to be the name OF that plate. These are hue-ordered from red, and a
+    # list that starts anywhere else labels every dog a third of a wheel from its actual colour.
+    import colorsys as _cs
+    bad = []
+    for n in KENNEL + ["dog%d" % i for i in range(60)]:
+        t = avatar.traits(n)
+        r, g, b = (int(t["plate_hex"][i:i + 2], 16) / 255 for i in (1, 3, 5))
+        want = avatar.PLATE_NAMES[int(_cs.rgb_to_hls(r, g, b)[0] * len(avatar.PLATE_NAMES))
+                                  % len(avatar.PLATE_NAMES)]
+        if t["plate"] != want:
+            bad.append("%s: called %s, is %s" % (n, t["plate"], want))
+    check(not bad, "each plate is called what it actually is (%s)" % (bad[:2] or "all correct"))
+
+    # No combination may hide the dog in its own background. Checked over the WHOLE space, not a
+    # sample: a fixed plate lightness passed every dog anyone happened to look at while leaving
+    # measured contrast 1.00 — identical luminance — for half the coats.
+    lo = 9.9
+    for coat in avatar.COATS:
+        ears = avatar._hls(coat[1], coat[2], coat[3])
+        for off in avatar.PLATE_OFFSETS:
+            p = avatar._plate(coat[1] + off, ears)
+            la, lb = avatar._lum(p), avatar._lum(ears)
+            lo = min(lo, (max(la, lb) + 0.05) / (min(la, lb) + 0.05))
+    check(lo > 1.25, "every one of the %d plates separates from its own head (worst %.2f)"
+          % (len(avatar.COATS) * len(avatar.PLATE_OFFSETS), lo))
+
+    check(len({avatar.traits(n)["eye_hex"] for n in KENNEL}) == 1,
+          "every dog has the SAME natural dark eye — the coat carries the identity, not a bulb")
+    eye_l = sum(int(avatar.EYE[i:i + 2], 16) for i in (1, 3, 5)) / (3 * 255)
+    check(eye_l < 0.25, "and that eye is dark (mean %.2f) rather than a lamp" % eye_l)
+
+    # --- the claim the design rests on: those two fills are the eyes -----------------------------
+    src = open(avatar.LOGO, encoding="utf-8").read()
+    marked = avatar.svg("Rowan", src)
+    eye_hex = avatar.traits("Rowan")["eye_hex"]
+    check(marked.count('fill="%s"' % eye_hex) == 2,
+          "exactly two fills become the eye colour — one eye each, nothing else recoloured with it")
+
+    # and those two fills must be WHERE THE EYES ARE. Proved with a colour that cannot be confused
+    # with anything else in the drawing: matching on the shipped eye colour would find the coat too,
+    # now that the eye is a natural brown sitting among browns — which it duly did, and passed.
+    marker = "#FF00FF"
+    probe = marked.replace('fill="%s"' % eye_hex, 'fill="%s"' % marker)
+    w, h, rows = png_pixels(avatar._png(
+        avatar._raster(avatar._polygons(probe), 128), 128))
+    want = (255, 0, 255)
+
+    def close(p, q, tol=26):
+        return all(abs(a - b) <= tol for a, b in zip(p, q))
+
+    hits = [(x, y) for y in range(h) for x, px in enumerate(rows[y]) if close(px, want)]
+    check(len(hits) > 20, "the eye fills survive rasterising (%d px)" % len(hits))
+    if hits:
+        xs = [x for x, _ in hits]
+        ys = [y for _, y in hits]
+        # Two blobs, side by side, in the upper half of a face — that is what eyes are.
+        mid = (min(xs) + max(xs)) / 2
+        left = [x for x in xs if x < mid]
+        right = [x for x in xs if x >= mid]
+        check(len(left) > 5 and len(right) > 5, "in two groups, left and right of centre")
+        check(max(ys) < h * 0.6, "in the upper part of the head, where eyes are")
+
+    # --- geometry is never touched ---------------------------------------------------------------
+    d_src = re.findall(r'd="([^"]*)"', src)
+    d_out = re.findall(r'd="([^"]*)"', marked)
+    check(d_src == d_out and len(d_src) > 20,
+          "every path's geometry is byte-identical — only fills change (%d paths)" % len(d_src))
+    check('<rect' in marked and marked.index("<rect") < marked.index("<path"),
+          "the plate is inserted BEHIND the head, not over it")
+    clear = avatar.svg("Rowan", src, plate=False)
+    check("<rect" not in clear and re.findall(r'd="([^"]*)"', clear) == d_src,
+          "the first-party variant removes only the plate and keeps every path")
+
+    # --- the white face stays the face -----------------------------------------------------------
+    for n in ("Rowan", "Juno", "Skye"):
+        out = avatar.svg(n, src)
+        check('fill="#FCFCFB"' in out, "%s keeps the white blaze — it is what makes it a collie" % n)
+
+    # --- PNG is a PNG -----------------------------------------------------------------------------
+    data = avatar.png("Meg", 64)
+    check(data[:8] == b"\x89PNG\r\n\x1a\n", "the output is a real PNG")
+    w, h, depth, ctype = struct.unpack(">IIBB", data[16:26])
+    check((w, h, depth, ctype) == (64, 64, 8, 2), "64x64, 8-bit truecolour")
+    check(len(png_pixels(data)[2]) == 64, "and it decodes back to 64 rows")
+    clear_data = avatar.png("Meg", 64, plate=False)
+    cw, ch, depth, ctype = struct.unpack(">IIBB", clear_data[16:26])
+    clear_rows = png_pixels(clear_data)[2]
+    alphas = [px[3] for row in clear_rows for px in row]
+    check((cw, ch, depth, ctype) == (64, 64, 8, 6),
+          "the first-party avatar is 8-bit RGBA")
+    check(clear_rows[0][0][3] == 0 and max(alphas) == 255 and 0 in alphas,
+          "its background is genuinely transparent while the dog stays opaque")
+    avatar._cached_named_png.cache_clear()
+    avatar.png("Cache Me", 64, plate=False)
+    before = avatar._cached_named_png.cache_info()
+    avatar.png("  cache me  ", 64, plate=False)
+    after = avatar._cached_named_png.cache_info()
+    check(after.hits == before.hits + 1 and after.maxsize == 64,
+          "repeated first-party identity polls reuse a bounded deterministic render cache")
+
+    # --- stdlib only, because collie's core is ----------------------------------------------------
+    mod = open(os.path.join(ROOT, "harness", "avatar.py"), encoding="utf-8").read()
+    third_party = [m for m in re.findall(r"^\s*(?:import|from)\s+([A-Za-z_][\w.]*)", mod, re.M)
+                   if m.split(".")[0] not in
+                   {"os", "re", "sys", "zlib", "struct", "hashlib", "colorsys", "functools",
+                    "math", "io"}]
+    check(not third_party, "no third-party imports (found %s)" % (third_party or "none"))
+
+    print("\n  " + ("%d FAILED" % len(fails) if fails else "avatar: all green"))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

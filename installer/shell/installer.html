@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Collie Setup</title>
+<link rel="stylesheet" href="fonts.css">
+<style>
+  :root{
+    --ink:#F4F5FA; --muted:#9DA3B6; --faint:#6A6F82;
+    --glass:rgba(255,255,255,.045); --glass-hi:rgba(255,255,255,.09); --stroke:rgba(255,255,255,.08);
+    --accent:#6366F1; --accent2:#8B8CF7; --glow:rgba(110,110,245,.4); --ok:#5FC79A;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%; overflow:hidden;}
+  body{
+    font-family:'Nunito',system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    color:var(--ink); font-weight:500; -webkit-user-select:none; user-select:none;
+    background:#09090C;
+  }
+  /* no white system scrollbars anywhere; dark + thin where a scroll is unavoidable (the dropdown) */
+  ::-webkit-scrollbar{width:8px; height:8px;}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16); border-radius:99px;}
+  ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.28);}
+  ::-webkit-scrollbar-track{background:transparent;}
+  #aurora{position:fixed; inset:0; z-index:0;}
+  /* fine film grain — the texture that makes a flat dark UI read as premium (Raycast) */
+  .grain{position:fixed; inset:0; z-index:2; pointer-events:none; opacity:.045; mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
+  /* a soft vignette to seat the content and round the light off toward the edges */
+  .vignette{position:fixed; inset:0; z-index:1; pointer-events:none;
+    background:radial-gradient(120% 100% at 50% 34%, transparent 46%, rgba(6,6,10,.55) 100%);}
+  .app{position:relative; z-index:3; height:100%; display:flex; flex-direction:column;}
+
+  .titlebar{height:48px; flex:none; display:flex; align-items:center; padding:0 14px 0 22px;
+    -webkit-app-region:drag; app-region:drag;}
+  .brandmini{display:flex; align-items:center; gap:9px; opacity:0; transition:opacity .5s;}
+  .brandmini.show{opacity:.85;}
+  .brandmini img{width:18px; height:18px;}
+  .brandmini span{font-family:'Quicksand'; font-size:14px; font-weight:600; letter-spacing:.2px;}
+  .tb-spacer{flex:1;}
+  .winbtn{-webkit-app-region:no-drag; app-region:no-drag; width:34px; height:30px; border-radius:9px;
+    display:flex; align-items:center; justify-content:center; color:var(--faint); cursor:pointer; font-size:14px; transition:.16s;}
+  .winbtn:hover{background:rgba(255,255,255,.08); color:var(--ink);}
+  .winbtn.close:hover{background:rgba(226,90,74,.9); color:#fff;}
+
+  .stage{flex:1; position:relative; overflow:hidden;}
+  .screen{position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding:4px 52px 44px; opacity:0; transform:translateY(18px) scale(.985); pointer-events:none;
+    transition:opacity .55s cubic-bezier(.2,.7,.2,1), transform .55s cubic-bezier(.2,.7,.2,1);}
+  .screen.active{opacity:1; transform:none; pointer-events:auto;}
+  .screen.leaving{opacity:0; transform:translateY(-16px) scale(.99);}
+  /* form screens (language, options): a real column — scrollable body + a footer nav that can never
+     overlap the content (the previous absolute nav covered the install-location line) */
+  .screen.form{justify-content:flex-start; padding:0;}
+  /* fits on one page normally; a DARK, thin scrollbar appears only if a display/DPI makes it overflow
+     (never clips content, never the white system bar) */
+  .screen.form .body{width:100%; flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column;
+    align-items:center; padding:20px 52px 10px;}
+  .screen.form .nav{position:static; height:74px; border-top:1px solid rgba(255,255,255,.06); background:none;}
+
+  .nav{position:absolute; left:0; right:0; bottom:0; height:84px; display:flex; align-items:center; justify-content:flex-end; gap:12px; padding:0 44px;}
+
+  .btn{-webkit-app-region:no-drag; font-family:'Nunito'; border:1px solid transparent; border-radius:13px;
+    padding:12px 24px; font-size:14.5px; font-weight:700; cursor:pointer; transition:.2s; letter-spacing:.2px;}
+  .btn:active{transform:translateY(1px) scale(.99);}
+  .btn.primary{color:#fff; background:var(--accent); box-shadow:0 8px 26px -8px var(--glow), inset 0 1px 0 rgba(255,255,255,.22);}
+  .btn.primary:hover{background:var(--accent2); box-shadow:0 12px 34px -8px var(--glow);}
+  .btn.ghost{color:var(--muted); background:var(--glass); border-color:var(--stroke); backdrop-filter:blur(8px);}
+  .btn.ghost:hover{color:var(--ink); background:var(--glass-hi);}
+
+  /* WELCOME — minimal: bloom does the talking */
+  .logo-wrap{position:relative; width:106px; height:106px; margin-bottom:2px; animation:float 7s ease-in-out infinite;}
+  @keyframes float{0%,100%{transform:translateY(0);} 50%{transform:translateY(-8px);}}
+  .logo-wrap img{width:100%; height:100%; filter:drop-shadow(0 12px 40px rgba(120,120,250,.4));}
+  .wordmark{font-family:'Quicksand'; font-size:52px; font-weight:700; letter-spacing:-1px; line-height:1; margin-top:14px;}
+  .tagline{margin-top:13px; color:var(--muted); font-size:16.5px; font-weight:500; letter-spacing:.1px;}
+  .pillrow{margin-top:20px; display:flex; gap:10px; align-items:center; color:var(--faint); font-size:10.5px; font-weight:700; letter-spacing:.2em; text-transform:uppercase;}
+  .pillrow i{width:3px; height:3px; border-radius:50%; background:var(--faint);}
+  .cta{margin-top:26px; padding:14px 36px; font-size:15px; border-radius:15px;}
+
+  .head{width:100%; max-width:588px; margin-bottom:12px;}
+  .head h2{font-family:'Quicksand'; font-size:23px; font-weight:700; letter-spacing:-.3px;}
+  .head p{margin-top:5px; color:var(--muted); font-size:13.5px; font-weight:500;}
+
+  .langgrid{width:100%; max-width:588px; display:grid; grid-template-columns:repeat(4,1fr); gap:8px;}
+  .lang{position:relative; padding:10px 10px; border-radius:14px; background:var(--glass); border:1px solid var(--stroke);
+    cursor:pointer; text-align:center; transition:.18s; backdrop-filter:blur(12px);}
+  .lang:hover{background:var(--glass-hi); border-color:rgba(255,255,255,.16); transform:translateY(-2px);}
+  .lang .nat{font-size:14.5px; font-weight:700;}
+  .lang .en{margin-top:1px; font-size:10.5px; font-weight:600; color:var(--faint);}
+  .lang.sel{border-color:transparent; background:rgba(99,102,241,.16); box-shadow:0 0 0 1.5px var(--accent2), 0 14px 32px -14px var(--glow);}
+  .lang.sel .en{color:var(--accent2);}
+  .lang .tick{position:absolute; top:8px; right:9px; width:16px; height:16px; border-radius:50%; background:var(--accent);
+    color:#fff; font-size:10px; line-height:16px; opacity:0; transform:scale(.4); transition:.2s;}
+  .lang.sel .tick{opacity:1; transform:none;}
+  .morerow{width:100%; max-width:588px; margin-top:10px; display:flex; align-items:center; gap:14px;}
+  .morerow label{color:var(--faint); font-size:12.5px; font-weight:600; white-space:nowrap;}
+  /* custom dark dropdown (native <select> pops a white, unthemed, hard-to-use list in WebView2) */
+  .dd{position:relative; flex:1; -webkit-app-region:no-drag;}
+  .dd-btn{display:flex; align-items:center; justify-content:space-between; font-family:'Nunito'; font-weight:600;
+    background:var(--glass); color:var(--muted); border:1px solid var(--stroke); border-radius:12px;
+    padding:11px 14px; font-size:13.5px; cursor:pointer; backdrop-filter:blur(12px);}
+  .dd-btn:hover{border-color:var(--glass-hi); color:var(--ink);}
+  .dd-btn::after{content:"▾"; color:var(--faint); font-size:11px; margin-left:8px;}
+  .dd-list{position:absolute; left:0; right:0; bottom:calc(100% + 8px); max-height:224px; overflow-y:auto;
+    background:#14141C; border:1px solid var(--stroke); border-radius:14px; padding:6px;
+    box-shadow:0 20px 50px -12px rgba(0,0,0,.7); opacity:0; transform:translateY(6px); pointer-events:none;
+    transition:.16s; z-index:20;}
+  .dd.open .dd-list{opacity:1; transform:none; pointer-events:auto;}
+  .dd-item{padding:9px 12px; border-radius:9px; font-size:13px; font-weight:600; color:var(--muted); cursor:pointer;}
+  .dd-item:hover{background:var(--glass-hi); color:var(--ink);}
+  .dd-item .en{color:var(--faint); font-weight:500; font-size:11.5px; margin-left:6px;}
+
+  .opts{width:100%; max-width:588px; display:flex; flex-direction:column; gap:11px;}
+  .opt{display:flex; align-items:center; gap:15px; padding:14px 16px; border-radius:16px; background:var(--glass); border:1px solid var(--stroke); backdrop-filter:blur(12px);}
+  .opt .txt{flex:1;} .opt .txt .t{font-size:14.5px; font-weight:700;} .opt .txt .d{margin-top:3px; font-size:12px; font-weight:500; color:var(--muted); line-height:1.4;}
+  .switch{-webkit-app-region:no-drag; width:48px; height:28px; border-radius:99px; background:rgba(255,255,255,.13); position:relative; cursor:pointer; transition:.22s; flex:none;}
+  .switch::after{content:""; position:absolute; top:3px; left:3px; width:22px; height:22px; border-radius:50%; background:#fff; transition:.22s; box-shadow:0 2px 7px rgba(0,0,0,.4);}
+  .switch.on{background:var(--accent);} .switch.on::after{left:23px;}
+  /* install-path row — now selectable via the host's folder picker */
+  .pathrow{width:100%; max-width:588px; margin-top:12px; display:flex; align-items:center; gap:12px;
+    padding:12px 14px; border-radius:14px; background:var(--glass); border:1px solid var(--stroke); backdrop-filter:blur(12px);}
+  .pathrow .pi{flex:1; min-width:0;}
+  .pathrow .pi .k{font-size:11px; font-weight:700; letter-spacing:.03em; color:var(--faint); text-transform:uppercase;}
+  .pathrow .pi .v{margin-top:2px; font-family:ui-monospace,Consolas,monospace; font-size:12px; color:var(--muted);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .btn.small{padding:8px 16px; font-size:12.5px; border-radius:10px;}
+
+  .prog-wrap{width:100%; max-width:470px; text-align:center;}
+  .spinner{width:90px; height:90px; margin:0 auto 26px; position:relative;}
+  .spinner .core{position:absolute; inset:0; display:flex; align-items:center; justify-content:center;}
+  .spinner .core img{width:44px; height:44px; filter:drop-shadow(0 6px 20px rgba(120,120,250,.5));}
+  .spinner .orb{position:absolute; inset:0; border-radius:50%; border:2.5px solid transparent; border-top-color:var(--accent2); border-right-color:var(--accent); animation:spin 1.05s cubic-bezier(.6,.15,.4,.85) infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  /* failure: stop the orb spinning and turn everything coral so it reads as an error, not a hang */
+  .spinner.err .orb{animation:none; border-top-color:#e0574a; border-right-color:#e0574a; border-bottom-color:#e0574a; border-left-color:#e0574a;}
+  .prog-status.err{color:#e0574a;}
+  .prog-status{font-family:'Quicksand'; font-size:18px; font-weight:600;}
+  .prog-sub{margin-top:7px; color:var(--muted); font-size:13px; font-weight:500; min-height:17px;}
+  .track{margin-top:24px; height:6px; border-radius:99px; background:rgba(255,255,255,.08); overflow:hidden;}
+  .fill{height:100%; width:0%; border-radius:99px; background:linear-gradient(90deg,var(--accent),var(--accent2)); box-shadow:0 0 16px var(--glow); transition:width .55s cubic-bezier(.3,.7,.3,1);}
+
+  .check{width:90px; height:90px; margin-bottom:22px; border-radius:50%; background:radial-gradient(circle at 50% 42%,rgba(95,199,154,.28),transparent 62%); display:flex; align-items:center; justify-content:center;}
+  .check svg{width:56px; height:56px;}
+  .check circle{stroke:var(--ok); stroke-width:3.5; fill:none; stroke-dasharray:150; stroke-dashoffset:150; animation:draw .7s ease forwards;}
+  .check path{stroke:var(--ok); stroke-width:5; fill:none; stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:40; stroke-dashoffset:40; animation:draw .45s .5s ease forwards;}
+  @keyframes draw{to{stroke-dashoffset:0;}}
+</style>
+</head>
+<body>
+<canvas id="aurora"></canvas>
+<div class="vignette"></div>
+<div class="grain"></div>
+<div class="app">
+  <div class="titlebar">
+    <div class="brandmini" id="brandmini"><img src="collie-logo.png" alt=""><span>Collie</span></div>
+    <div class="tb-spacer"></div>
+    <div class="winbtn close" id="closeBtn" title="Close">&#10005;</div>
+  </div>
+  <div class="stage">
+    <section class="screen active" data-screen="welcome">
+      <div class="logo-wrap"><img src="collie-logo.png" alt="Collie"></div>
+      <div class="wordmark">Collie</div>
+      <div class="tagline">Humans' best AI friend.</div>
+      <div class="pillrow"><span>OPEN SOURCE</span><i></i><span>RUNS LOCALLY</span><i></i><span>NO TELEMETRY</span></div>
+      <button class="btn primary cta" data-go="language">Install Collie &nbsp;→</button>
+    </section>
+    <section class="screen form" data-screen="language">
+      <div class="body">
+        <div class="head"><h2>Choose your language</h2><p>For Collie and the rest of Setup — you can change it anytime later.</p></div>
+        <div class="langgrid" id="langgrid"></div>
+        <div class="morerow"><label>More languages</label>
+          <div class="dd" id="moreDD"><div class="dd-btn" id="moreBtn">More languages…</div><div class="dd-list" id="moreList"></div></div>
+        </div>
+      </div>
+      <div class="nav"><button class="btn ghost" data-go="welcome">Back</button><button class="btn primary" data-go="options">Continue</button></div>
+    </section>
+    <section class="screen form" data-screen="options">
+      <div class="body">
+        <div class="head"><h2>One quick option</h2><p>Off by default — you can turn it on any time in Collie's settings.</p></div>
+        <div class="opts">
+          <div class="opt"><div class="txt"><div class="t">Live star-map wallpaper</div><div class="d">Show Collie's animated star-map behind your desktop icons, starting at logon.</div></div><div class="switch" data-opt="wallpaper"></div></div>
+        </div>
+        <div class="pathrow">
+          <div class="pi"><div class="k">Install location · per-user, no admin</div><div class="v" id="pathVal">%LOCALAPPDATA%\Programs\Collie</div></div>
+          <button class="btn ghost small" id="browseBtn">Change…</button>
+        </div>
+      </div>
+      <div class="nav"><button class="btn ghost" data-go="language">Back</button><button class="btn primary" id="installBtn">Install</button></div>
+    </section>
+    <section class="screen" data-screen="installing">
+      <div class="prog-wrap"><div class="spinner" id="spinner"><div class="orb"></div><div class="core"><img src="collie-logo.png" alt=""></div></div>
+        <div class="prog-status" id="progStatus">Preparing…</div><div class="prog-sub" id="progSub"></div>
+        <div class="track"><div class="fill" id="progFill"></div></div>
+        <div class="nav" id="failNav" style="display:none; position:static; height:auto; margin-top:24px; padding:0; justify-content:center;">
+          <button class="btn ghost" id="failClose">Close</button></div></div>
+    </section>
+    <section class="screen" data-screen="done">
+      <div class="check"><svg viewBox="0 0 60 60"><circle cx="30" cy="30" r="24"/><path d="M18 31 l8 8 l16 -18"/></svg></div>
+      <div class="wordmark" style="font-size:36px; letter-spacing:-.5px;">All set</div>
+      <div class="tagline">Collie is installed. Pick a brain on first launch — an existing<br>Claude, Codex or Grok subscription connects in one click.</div>
+      <div class="nav"><button class="btn ghost" id="doneClose">Close</button><button class="btn primary" id="launchBtn">Launch Collie</button></div>
+    </section>
+  </div>
+</div>
+<script>
+  const host=(window.chrome&&window.chrome.webview)?window.chrome.webview:null;
+  function send(a,d){ try{ host&&host.postMessage(JSON.stringify(Object.assign({action:a},d||{}))); }catch(e){} }
+  const CHIPS=[["English","English","en"],["简体中文","Chinese (Simp.)","zh"],["繁體中文","Chinese (Trad.)","zhtw"],["Español","Spanish","es"],["Français","French","fr"],["Deutsch","German","de"],["Português","Portuguese","ptbr"],["Русский","Russian","ru"],["日本語","Japanese","ja"],["한국어","Korean","ko"],["Italiano","Italian","it"],["العربية","Arabic","ar"]];
+  const MORE=[["Bahasa Indonesia","Indonesian","id"],["Tiếng Việt","Vietnamese","vi"],["Türkçe","Turkish","tr"],["Polski","Polish","pl"],["Nederlands","Dutch","nl"],["ไทย","Thai","th"],["Українська","Ukrainian","uk"],["हिन्दी","Hindi","hi"],["Ελληνικά","Greek","el"],["Čeština","Czech","cs"],["Svenska","Swedish","sv"],["Dansk","Danish","da"],["Suomi","Finnish","fi"],["Română","Romanian","ro"],["Magyar","Hungarian","hu"],["עברית","Hebrew","he"],["Norsk","Norwegian","no"],["Български","Bulgarian","bg"],["فارسی","Farsi","fa"],["தமிழ்","Tamil","ta"]];
+  // "Use my real browser" moved out of the installer: it really means installing a Chrome/Edge
+  // extension, which belongs in the app's first-run onboarding (in the browser), not a Setup checkbox.
+  let state={lang:"en",wallpaper:false,dir:""}; const $=(s)=>document.querySelector(s),$$=(s)=>document.querySelectorAll(s);
+  const grid=$("#langgrid"); CHIPS.forEach(([n,e,c])=>{ const d=document.createElement("div"); d.className="lang"; d.dataset.code=c; d.innerHTML=`<div class="tick">✓</div><div class="nat">${n}</div><div class="en">${e}</div>`; d.onclick=()=>selectLang(c); grid.appendChild(d); });
+  // custom dark dropdown
+  const dd=$("#moreDD"), ddBtn=$("#moreBtn"), ddList=$("#moreList");
+  MORE.forEach(([n,e,c])=>{ const it=document.createElement("div"); it.className="dd-item"; it.dataset.code=c;
+    it.innerHTML=`${n}<span class="en">${e}</span>`; it.onclick=()=>{ selectLang(c); ddBtn.textContent=n; dd.classList.remove("open"); }; ddList.appendChild(it); });
+  ddBtn.onclick=(ev)=>{ ev.stopPropagation(); dd.classList.toggle("open"); };
+  document.addEventListener("click",()=>dd.classList.remove("open"));
+  function selectLang(c){ state.lang=c; $$(".lang").forEach(l=>l.classList.toggle("sel",l.dataset.code===c));
+    if(CHIPS.some(x=>x[2]===c)) ddBtn.textContent="More languages…"; send("lang",{code:c}); }
+  selectLang("en");   // English by default; the host may re-select to match the OS language
+  $$(".switch").forEach(sw=>sw.onclick=()=>{ sw.classList.toggle("on"); state[sw.dataset.opt]=sw.classList.contains("on"); });
+  let current="welcome"; function goto(n){ if(n===current)return; const f=$(`.screen[data-screen="${current}"]`),t=$(`.screen[data-screen="${n}"]`); f.classList.add("leaving"); f.classList.remove("active"); setTimeout(()=>f.classList.remove("leaving"),550); t.classList.add("active"); current=n; $("#brandmini").classList.toggle("show",n!=="welcome"); }
+  $$("[data-go]").forEach(b=>b.onclick=()=>goto(b.dataset.go));
+  $("#closeBtn").onclick=()=>send("close"); $("#doneClose").onclick=()=>send("close"); $("#launchBtn").onclick=()=>send("launch");
+  $("#failClose").onclick=()=>send("close");
+  document.querySelector(".titlebar").addEventListener("mousedown",(e)=>{ if(e.target.closest(".winbtn"))return; if(e.button===0)send("drag"); });
+  $("#browseBtn").onclick=(ev)=>{ ev.stopPropagation(); send("browse"); };   // host opens a folder picker
+  $("#installBtn").onclick=()=>{ goto("installing"); send("install",{lang:state.lang,wallpaper:state.wallpaper,dir:state.dir}); if(!host)sim(); };
+  function onP(p){ if(p.phase!=null)$("#progStatus").textContent=p.phase; if(p.detail!=null)$("#progSub").textContent=p.detail; if(p.pct!=null)$("#progFill").style.width=Math.max(3,Math.min(100,p.pct))+"%";
+    if(p.phase&&/^setup (failed|error)/i.test(p.phase)){ document.getElementById("spinner").classList.add("err"); $("#progStatus").classList.add("err"); document.getElementById("failNav").style.display="flex"; }
+    if(p.done)setTimeout(()=>goto("done"),550); }
+  // PostWebMessageAsJson delivers e.data already parsed (an object); PostWebMessageAsString delivers
+  // a string. Handle both. {type:"dir"} = the folder the user picked; anything else is progress.
+  if(host)host.addEventListener("message",e=>{ var d=e.data; if(typeof d==="string"){ try{ d=JSON.parse(d); }catch(_){ return; } } if(!d||typeof d!=="object")return;
+    if(d.type==="defaultdir"){ $("#pathVal").textContent=d.path; return; }   // absolute C:\… default
+    if(d.type==="dir"){ state.dir=d.path; $("#pathVal").textContent=d.path; return; } onP(d); });
+  function sim(){ const s=[["Unpacking the runtime…","Embeddable Python + Collie",24],["Installing the desktop engine…","WebView2 host",50],["Setting your language…","",66],["Registering shortcuts…","Start menu + desktop",84],["Finishing up…","",100]]; let i=0;(function n(){ if(i>=s.length){onP({done:true});return;} const[a,b,c]=s[i++]; onP({phase:a,detail:b,pct:c}); setTimeout(n,760); })(); }
+
+  // ---- aurora: soft colour blooms slowly orbiting the centre + fine star dust (Raycast-grade depth) ----
+  const cv=$("#aurora"), ctx=cv.getContext("2d"); let W,H,DPR,cx,cy,blobs=[],dust=[];
+  const PAL=[[99,102,241],[139,92,246],[56,140,230],[224,118,150]];   // indigo · violet · blue · a warm rose so it isn't all cold
+  function rand(a,b){return a+Math.random()*(b-a);}
+  function resize(){ DPR=Math.min(2,devicePixelRatio||1); W=cv.width=innerWidth*DPR; H=cv.height=innerHeight*DPR; cv.style.width=innerWidth+"px"; cv.style.height=innerHeight+"px"; cx=W/2; cy=H*0.40; build(); }
+  function build(){
+    blobs=[]; for(let i=0;i<4;i++){ blobs.push({c:PAL[i%PAL.length], orb:rand(0.16,0.42)*W, size:rand(0.5,0.9)*W, a0:rand(0,6.28), sp:rand(0.6,1.2)*(Math.random()<.5?-1:1), al:rand(0.10,0.18)}); }
+    dust=[]; const n=Math.round(innerWidth*innerHeight/7000); const R=Math.hypot(W,H)*0.6;
+    for(let i=0;i<n;i++){ dust.push({rad:Math.pow(Math.random(),.6)*R, a:rand(0,6.28), r:rand(0.4,1.4)*DPR, base:rand(0.2,0.7), ph:rand(0,6.28), sp:rand(0.5,1.5)}); }
+  }
+  const OMEGA=0.11; let t0=performance.now();   // a touch faster so the swirl reads clearly
+  function frame(now){ const t=(now-t0)/1000; ctx.clearRect(0,0,W,H);
+    ctx.globalCompositeOperation="lighter";
+    for(const b of blobs){ const ang=b.a0+t*OMEGA*b.sp; const x=cx+Math.cos(ang)*b.orb, y=cy+Math.sin(ang)*b.orb*0.7;
+      const g=ctx.createRadialGradient(x,y,0,x,y,b.size); const c=b.c;
+      g.addColorStop(0,"rgba("+c[0]+","+c[1]+","+c[2]+","+b.al+")"); g.addColorStop(.5,"rgba("+c[0]+","+c[1]+","+c[2]+","+(b.al*0.4)+")"); g.addColorStop(1,"rgba("+c[0]+","+c[1]+","+c[2]+",0)");
+      ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
+    ctx.globalCompositeOperation="source-over";
+    for(const s of dust){ const ang=s.a+t*OMEGA*0.8*(1+40*DPR/(s.rad+40*DPR)); const x=cx+Math.cos(ang)*s.rad, y=cy+Math.sin(ang)*s.rad*0.86;
+      const a=s.base*(0.5+0.5*Math.sin(t*s.sp+s.ph)); ctx.beginPath(); ctx.arc(x,y,s.r,0,6.2832); ctx.fillStyle="rgba(210,214,255,"+a+")"; ctx.fill(); }
+    requestAnimationFrame(frame); }
+  addEventListener("resize",resize); resize(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,2882 @@
+"""Neutral primitives — the small, domain-agnostic action set a mission draws on.
+
+This is the answer to "don't template every errand": instead of marketplace.* /
+dentist.* / refund.* capabilities, there is ONE generic set the model composes
+toward any goal. Selling a car, booking a table, chasing a refund all use the
+SAME five — only the args (which the model fills) differ:
+
+  research   (read)        gather facts from the web toward a question
+  compose    (read)        turn facts into text (a listing, a reply, an email)
+  observe    (read)        re-observe the world (logged-out fetch for evidence, or
+                           an authed browser read to poll an inbox)
+  web.submit (IRREVERSIBLE) fill + submit a non-commerce form (publish a listing)
+  web.send   (IRREVERSIBLE) send a message (a reply, a negotiation, an email)
+
+Risk is fixed by PRIMITIVE, not by errand (plan §5.1): the irreversible ones are
+inherently gated — the leash parks them for confirm unless the mission is
+pre-authorized within bounds. The reversible reads run freely under the leash.
+
+TWO registrations behind ONE surface:
+  - register_primitives(stub=True)  — canned bodies, no I/O. The container tests
+    and the safe default use these.
+  - register_primitives(stub=False, actuator=, provider=, research_runner=) — the
+    REAL bodies: research runs collie's browser research (research.py), compose
+    calls the model, observe re-fetches through webfetch / drives the browser,
+    web.submit/web.send drive a BrowserActuator (webact.py) and the submit is
+    verified by an INDEPENDENT logged-out re-fetch (observe.py). Every dependency
+    is injectable, so the real bodies are tested with fakes + a localhost fixture;
+    with no browser available they degrade to a clean 'no browser' verdict, never a
+    crash. The primitive NAMES / risk tiers / mission / leash never change.
+
+Nothing here evades detection; it automates the user's own actions on the user's
+own account, gated the same way every other action is.
+"""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import inspect
+import fnmatch
+import os
+import re
+import secrets
+import time
+import unicodedata
+from urllib.parse import urlsplit
+
+from .jobs import Capability, get_capability, register
+from .verifier import FAILED, INCONCLUSIVE, VERIFIED, Observation, Verdict
+
+
+def _canonical_visible_text(value) -> str:
+    """Normalize browser text before freshness comparisons.
+
+    Accessibility trees may reflow the same sentence across lines after a DOM
+    update.  Whitespace layout is not new evidence, and Unicode presentation
+    variants must not turn an old marker into an apparently fresh one.
+    """
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _int(v):
+    try:
+        return int(str(v).split()[0])
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+# ══════════════════════════ STUB bodies (canned, no I/O) ═══════════════════════
+def _stub_research(rec):
+    q = (rec.args or {}).get("query") or (rec.args or {}).get("goal") or ""
+    return {"case": {"researched": True}, "query": q,
+            "found": f"(stub) gathered facts for {q!r}"}
+
+
+def _stub_compose(rec):
+    a = rec.args or {}
+    facts = a.get("facts") or a.get("about") or a.get("query") or ""
+    # ``text`` is an already-finished literal. ``instruction`` asks the
+    # composer to create the deliverable. Keeping those meanings separate
+    # prevents "write a post about ..." from being stored as the post itself.
+    text = a.get("text") or (
+        f"(stub) composed text for {a.get('instruction')!r} about {facts!r}"
+        if a.get("instruction") else f"(stub) composed text about {facts!r}")
+    return {"case": {"composed": True}, "text": text}
+
+
+def _stub_observe(rec):
+    a = rec.args or {}
+    case = a.get("_case") or {}
+    n = (_int(a.get("observe_count")) or _int(case.get("observe_count")) or 0) + 1
+    present = n >= 2
+    return {"case": {"observe_count": n, "signal": present},
+            "present": present, "detail": f"(stub) observation #{n}, signal={present}"}
+
+
+def _stub_verification_fill(rec):
+    return {"case": {"verification_code_filled": True}, "filled": True,
+            "source": "connected_verification_inbox"}
+
+
+def _stub_identity_fill(rec):
+    field = str((rec.args or {}).get("field") or "").strip().lower()
+    return {"case": {"identity_field_filled": field or "identity"}, "filled": True,
+            "field": field or "identity", "source": "collie_work_identity",
+            "account": "[masked]"}
+
+
+def _stub_identity_status(rec):
+    return {"identity": {"email": "collie@example.invalid", "phone": "+15550100000",
+                         "principal": "collie", "status": "ready"}}
+
+
+def _stub_account_status(rec):
+    return {
+        "collie_id": "host-example",
+        "accounts": [],
+        "vault": {"available": True, "os_backed": True, "status": "available",
+                  "backend": "native_os_credential_store", "plaintext_fallback": False},
+    }
+
+
+def _stub_account_prepare(rec):
+    return {
+        "prepared": True,
+        "account": {
+            "account_id": "acct_example",
+            "origin": str((rec.args or {}).get("origin") or "https://example.invalid"),
+            "username": "collie@example.invalid",
+            "status": "registering",
+            "factor_classes": ["password"],
+        },
+        "credentials_ready": ["password"],
+    }
+
+
+def _stub_account_fill(rec):
+    factor = str((rec.args or {}).get("factor") or "password").strip().lower()
+    return {"case": {"account_factor_filled": factor}, "filled": True,
+            "account_id": str((rec.args or {}).get("account_id") or "acct_example"),
+            "factor": factor, "source": "native_account_vault"}
+
+
+def _stub_account_submit(rec):
+    account_id = str((rec.args or {}).get("account_id") or "acct_example")
+    return {"case": {"account_registration": {"account_id": account_id,
+                                                "status": "challenge_wait"}},
+            "submitted": True, "confirmed": True, "account_id": account_id,
+            "status": "challenge_wait", "postcondition": "fresh next-step state observed"}
+
+
+def _stub_account_complete(rec):
+    account_id = str((rec.args or {}).get("account_id") or "acct_example")
+    return {"case": {"account_registration": {"account_id": account_id,
+                                                "status": "active"}},
+            "completed": True, "account_id": account_id, "status": "active",
+            "evidence_hash": "0" * 64}
+
+
+def _stub_account_abort(rec):
+    return {"aborted": True,
+            "account_id": str((rec.args or {}).get("account_id") or "acct_example")}
+
+
+def _stub_communications_status(rec):
+    return {
+        "google_voice": {
+            "connected": False, "assigned": False, "ownership": "",
+            "verification_codes": {"configured": False, "runtime": "not_configured",
+                                   "persistent": False},
+            "sms": {"line_capable": False, "collie_dispatch_configured": False,
+                    "automation_permitted": False, "runtime": "not_configured"},
+            "calls": {"line_capable": False, "collie_dispatch_configured": False,
+                      "automation_permitted": False, "runtime": "not_configured"},
+        },
+        "programmable_telephony": {
+            "configured": False, "providers": [], "status": "not_configured",
+            "adapters": [
+                {"kind": "verified_assigned_caller_id", "configured": False,
+                 "capabilities": {"outbound_calls": True, "inbound_calls": False,
+                                  "sms": False}},
+                {"kind": "provider_owned_registered_number", "configured": False,
+                 "capabilities": {"outbound_calls": True, "inbound_calls": True,
+                                  "sms": "requires_sender_registration"}},
+            ],
+        },
+        "voice_synthesis": {"configured": False, "provider": "", "voice": "",
+                            "status": "not_configured"},
+    }
+
+
+def _real_identity_status(loader=None):
+    def execute(rec):
+        read = loader
+        if read is None:
+            from .workidentity import model_identity
+            read = model_identity
+        try:
+            identity = read() or {}
+        except Exception as exc:
+            return {"identity": {}, "status": "unavailable",
+                    "error": "%s: %s" % (type(exc).__name__, exc)}
+        public = {k: identity.get(k) for k in (
+            "principal", "collie_id", "name", "email", "phone", "username",
+            "mailbox_status", "phone_status", "ownership") if identity.get(k) not in (None, "")}
+        public["status"] = identity.get("status") or (
+            "ready" if public.get("email") and public.get("phone") else "needs_setup")
+        return {"identity": public}
+    return execute
+
+
+def _real_account_status(loader=None):
+    def execute(rec):
+        try:
+            if loader is not None:
+                result = loader() or {}
+            else:
+                from .accountcontrol import snapshot
+                from .brain_router import collie_device_id
+                result = snapshot(collie_id=collie_device_id(), model=True,
+                                  include_communications=False)
+            return {key: result.get(key) for key in ("collie_id", "accounts", "vault")}
+        except Exception:
+            return {"collie_id": "", "accounts": [],
+                    "vault": {"available": False, "os_backed": False,
+                              "status": "unavailable", "plaintext_fallback": False},
+                    "status": "unavailable"}
+    return execute
+
+
+def _account_registry(factory=None):
+    """Open the host-only registry without exposing its vault through a capability result."""
+    if factory is not None:
+        return factory()
+    from .accountcontrol import open_registry
+    from .brain_router import collie_device_id
+    return open_registry(collie_id=collie_device_id())
+
+
+def _real_account_prepare(registry_factory=None, identity_loader=None):
+    """Create one idempotent local signup record and a generated vault password.
+
+    This is deliberately only the *reversible preparation* half of signup.  A
+    later ``browse.submit`` remains the independently snapshotted consequential
+    action.  Neither the generated password nor an opaque vault reference crosses
+    this capability boundary.
+    """
+    def execute(rec):
+        args = rec.args or {}
+        origin = str(args.get("origin") or "").strip()
+        if not origin:
+            return {"prepared": False, "error": "the exact service origin is required"}
+        identity = {}
+        try:
+            if identity_loader is not None:
+                identity = identity_loader() or {}
+            else:
+                from .workidentity import model_identity
+                identity = model_identity() or {}
+        except Exception:
+            identity = {}
+        username = str(identity.get("email") or "").strip()
+        if not username:
+            return {"prepared": False,
+                    "error": "Collie's work mailbox is required before account preparation"}
+        if args.get("username") and str(args.get("username")).strip().casefold() != username.casefold():
+            return {"prepared": False,
+                    "error": "account.prepare is bound to Collie's canonical work mailbox"}
+        if args.get("ownership") or args.get("legal_principal"):
+            return {"prepared": False,
+                    "error": "account identity and legal ownership are host-bound, not model inputs"}
+        tenant = str(args.get("tenant") or "").strip()
+        scopes = args.get("scopes") or []
+        if not isinstance(scopes, list) or not all(
+                isinstance(item, str) and 0 < len(item) <= 160 for item in scopes):
+            return {"prepared": False, "error": "scopes must be bounded strings"}
+        factors = args.get("factor_classes") or []
+        if not isinstance(factors, list) or not all(isinstance(item, str) for item in factors):
+            return {"prepared": False, "error": "factor_classes must be strings"}
+        # Password is provisioned below and must not be pre-declared as metadata.
+        # TOTP/recovery material must be captured from the provider through a
+        # dedicated host-side enrollment adapter, never supplied by the model.
+        requested = sorted({str(item) for item in factors if str(item)})
+        if requested:
+            return {"prepared": False,
+                    "error": ("factor_classes are recorded only after provider enrollment; "
+                              "omit them during account preparation")}
+        try:
+            from .accounts import (CredentialExists, DuplicateAccount,
+                                   normalize_origin, normalize_tenant,
+                                   normalize_username)
+            normalized_origin = normalize_origin(origin)
+            normalized_tenant = normalize_tenant(tenant)
+            normalized_username = normalize_username(username)
+            registry = _account_registry(registry_factory)
+            try:
+                collie_id = str(getattr(registry, "collie_id", "") or "")
+                stable = "\0".join((collie_id, normalized_origin,
+                                      normalized_tenant, normalized_username))
+                idem = "account.prepare:" + hashlib.sha256(
+                    stable.encode("utf-8")).hexdigest()
+                legal = str(identity.get("legal_principal") or
+                            ("owner-of-collie:" + collie_id)).strip()
+                ownership = "collie_owned_work_identity"
+                try:
+                    account = registry.create(
+                        origin=normalized_origin, username=username,
+                        tenant=normalized_tenant, ownership=ownership,
+                        legal_principal=legal, scopes=scopes,
+                        factor_classes=requested, idempotency_key=idem)
+                except DuplicateAccount:
+                    expected_scopes = sorted({str(item) for item in scopes if str(item)})
+                    account = next((row for row in registry.list(include_retired=True)
+                                    if row.get("origin") == normalized_origin
+                                    and row.get("tenant", "") == normalized_tenant
+                                    and str(row.get("username") or "").strip().casefold()
+                                    == username.casefold()
+                                    and row.get("ownership") == ownership
+                                    and row.get("legal_principal") == legal
+                                    and sorted(row.get("scopes") or []) == expected_scopes
+                                    and row.get("status") not in {
+                                        "deletion_pending", "retired"}), None)
+                    if not account:
+                        raise RuntimeError(
+                            "an existing account identity conflicts with Collie's canonical ownership")
+                try:
+                    registry.create_credentials(account["account_id"], factors=("password",))
+                except CredentialExists:
+                    pass
+                account = registry.get(account["account_id"])
+                return {"case": {"account_registration": {
+                            "account_id": account["account_id"],
+                            "origin": account["origin"], "status": account["status"],
+                            "username": account["username"]}},
+                        "prepared": True, "account": account,
+                        "credentials_ready": ["password"]}
+            finally:
+                registry.close()
+        except Exception as exc:
+            return {"prepared": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    return execute
+
+
+_ACCOUNT_FIELD_PATTERNS = {
+    "password": re.compile(r"password|passcode|密码|密碼|口令", re.I),
+    "totp": re.compile(
+        r"authenticator|verification|security code|one[ -]?time|\botp\b|"
+        r"验证码|驗證碼|动态码|動態碼", re.I),
+}
+
+
+def _account_secret_field(snapshot, factor, requested=""):
+    text = str((snapshot or {}).get("snapshot") or "")
+    requested = str(requested or "").strip()
+    pattern = _ACCOUNT_FIELD_PATTERNS.get(factor)
+    hits = []
+    for line in text.splitlines():
+        match = re.search(
+            r"\[([^\]]+)\]\s+(?:textbox|input|combobox)\s+\"([^\"]+)\"",
+            line, re.I)
+        if not match:
+            continue
+        label = match.group(2)
+        matched = (requested.casefold() in label.casefold()) if requested else bool(
+            pattern and pattern.search(label))
+        if matched:
+            hits.append(match.group(1))
+    return hits[0] if len(hits) == 1 else ""
+
+
+def _totp_from_seed(raw: bytes, now=None) -> str:
+    """RFC 6238 SHA-1 code, used only inside the host-side fill closure."""
+    import base64
+    import hmac as _hmac
+    import struct
+    seed = bytes(raw).decode("ascii").strip().replace(" ", "").upper()
+    seed += "=" * ((8 - len(seed) % 8) % 8)
+    key = base64.b32decode(seed, casefold=True)
+    counter = int(time.time() if now is None else now) // 30
+    digest = _hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF) % 1000000
+    return "%06d" % value
+
+
+def _real_account_fill(actuator, registry_factory=None, now=None):
+    """Fill a vault-bound password/TOTP into the exact same-origin browser field."""
+    def execute(rec):
+        args = rec.args or {}
+        account_id = str(args.get("account_id") or "").strip()
+        factor = str(args.get("factor") or "password").strip().lower()
+        if not account_id or len(account_id) > 256:
+            return {"filled": False, "error": "a bounded account_id is required"}
+        if factor not in _ACCOUNT_FIELD_PATTERNS:
+            return {"filled": False, "error": "factor must be password or totp"}
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if (act is None or not hasattr(act, "snapshot")
+                or not hasattr(act, "type_ref_bound")):
+            return {"filled": False, "error": "connected browser is unavailable"}
+        # A browser "space" isolates tabs, not cookies.  Releasing Collie's
+        # credential into the user's everyday Chrome could bind it to the wrong
+        # signed-in identity.  Only the bridge process that launched Collie's
+        # dedicated persistent profile may receive vault material.
+        if not hasattr(act, "is_collie_profile") or not act.is_collie_profile():
+            return {
+                "filled": False,
+                "error": ("Collie account credentials require its isolated managed browser "
+                          "profile; reconnect with `collie browser-bridge --browser --headed`")
+            }
+        target = act.snapshot() or {}
+        identity = act.page_identity() if hasattr(act, "page_identity") else {}
+        identity = identity or {}
+        ref = _account_secret_field(target, factor, args.get("label"))
+        if not ref:
+            return {"filled": False, "error": "account secret field is missing or ambiguous"}
+        registry = None
+        try:
+            from .accounts import normalize_origin
+            registry = _account_registry(registry_factory)
+            account = registry.get(account_id)
+            full_url = str(target.get("url") or "")
+            if not full_url and hasattr(act, "current_url"):
+                full_url = str(act.current_url() or "")
+            parsed = urlsplit(full_url)
+            current_origin = normalize_origin(
+                "%s://%s" % (parsed.scheme, parsed.netloc)) if parsed.scheme and parsed.netloc else ""
+            if not current_origin or current_origin != account.get("origin"):
+                return {"filled": False,
+                        "error": "current page origin does not match the registered account"}
+
+            def consume(secret):
+                value = (bytes(secret).decode("utf-8") if factor == "password"
+                         else _totp_from_seed(bytes(secret), now=now))
+                try:
+                    act.type_ref_bound(
+                        ref, value, expected_origin=account.get("origin") or "",
+                        expected_tab_id=identity.get("tab_id"))
+                    return True
+                finally:
+                    value = ""
+
+            registry.use_secret(account_id, factor, consume)
+            return {"case": {"account_factor_filled": factor}, "filled": True,
+                    "account_id": account_id, "factor": factor,
+                    "origin": account.get("origin"), "source": "native_account_vault"}
+        except Exception as exc:
+            return {"filled": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            if registry is not None:
+                registry.close()
+    return execute
+
+
+def _account_prepare_verify(rec, result):
+    if (result or {}).get("prepared") and (result or {}).get("account", {}).get("account_id"):
+        return Verdict(VERIFIED, "account metadata and a generated password are ready in the native vault")
+    return Verdict(FAILED, (result or {}).get("error") or "account preparation failed")
+
+
+def _account_fill_verify(rec, result):
+    if (result or {}).get("filled"):
+        return Verdict(VERIFIED, "vault credential filled into the bound same-origin field; receipt is value-free")
+    return Verdict(FAILED, (result or {}).get("error") or "vault credential was not filled")
+
+
+def _real_communications_status(loader=None):
+    def execute(rec):
+        try:
+            if loader is not None:
+                return loader() or {}
+            from .accountcontrol import communications_status
+            return communications_status()
+        except Exception:
+            return {
+                "status": "unavailable",
+                "google_voice": {"connected": False, "assigned": False},
+                "programmable_telephony": {"configured": False,
+                                           "status": "unavailable"},
+                "voice_synthesis": {"configured": False, "status": "unavailable"},
+            }
+    return execute
+
+
+def _identity_fill_verify(rec, result):
+    if (result or {}).get("filled"):
+        return Verdict(VERIFIED, "Collie's public work identity was filled; receipt is value-free")
+    return Verdict(FAILED, (result or {}).get("error") or "work-identity field was not filled")
+
+
+def _verification_fill_verify(rec, result):
+    if (result or {}).get("filled"):
+        return Verdict(VERIFIED, "fresh matching verification code filled from connected inbox")
+    return Verdict(FAILED, (result or {}).get("error") or "verification code was not filled")
+
+
+def _verification_field(snapshot, requested=""):
+    text = str((snapshot or {}).get("snapshot") or "")
+    requested = str(requested or "").strip()
+    hits = []
+    for line in text.splitlines():
+        match = re.search(r"\[([^\]]+)\]\s+(?:textbox|input|combobox)\s+\"([^\"]+)\"", line, re.I)
+        if not match:
+            continue
+        label = match.group(2)
+        if requested:
+            match_label = requested.casefold() in label.casefold()
+        else:
+            match_label = bool(re.search(
+                r"verification|security code|one[ -]?time|\botp\b|验证码|驗證碼|校验码|確認碼",
+                label, re.I))
+        if match_label:
+            hits.append(match.group(1))
+    return hits[0] if len(hits) == 1 else ""
+
+
+_IDENTITY_FIELD_PATTERNS = {
+    "email": re.compile(r"e[ -]?mail|邮箱|郵箱|电子邮件|電子郵件", re.I),
+    "phone": re.compile(r"phone|mobile|telephone|手机号|手機號|电话号码|電話號碼", re.I),
+    "display_name": re.compile(r"display[ -]?name|full[ -]?name|name|显示名称|顯示名稱|姓名", re.I),
+    "username": re.compile(r"user[ -]?name|handle|用户名|使用者名稱|帳號", re.I),
+}
+
+
+def _identity_field(snapshot, kind, requested=""):
+    """Resolve exactly one visible identity field without ever accepting its value as an arg."""
+    text = str((snapshot or {}).get("snapshot") or "")
+    requested = str(requested or "").strip()
+    pattern = _IDENTITY_FIELD_PATTERNS.get(kind)
+    hits = []
+    for line in text.splitlines():
+        match = re.search(r"\[([^\]]+)\]\s+(?:textbox|input|combobox)\s+\"([^\"]+)\"", line, re.I)
+        if not match:
+            continue
+        label = match.group(2)
+        if requested:
+            matched = requested.casefold() in label.casefold()
+        else:
+            matched = bool(pattern and pattern.search(label))
+        if matched:
+            hits.append(match.group(1))
+    return hits[0] if len(hits) == 1 else ""
+
+
+def _real_identity_fill(actuator, identity_reader=None):
+    """Fill Collie's model-visible public identity without copying it into receipts.
+
+    The model already knows Collie's full public mailbox/assigned line. It supplies a
+    field kind and optional visible label so the executor can type the authoritative
+    current value while keeping durable Mission state and audit receipts value-free.
+    """
+    allowed = frozenset(_IDENTITY_FIELD_PATTERNS)
+
+    def execute(rec):
+        args = rec.args or {}
+        field = str(args.get("field") or "").strip().lower().replace("-", "_")
+        if field not in allowed:
+            return {"filled": False, "error": "field must be email, phone, display_name, or username"}
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if act is None or not hasattr(act, "snapshot"):
+            return {"filled": False, "error": "connected browser is unavailable"}
+        target = act.snapshot() or {}
+        ref = _identity_field(target, field, args.get("label"))
+        if not ref:
+            return {"filled": False, "error": "work-identity field is missing or ambiguous"}
+        try:
+            if field == "phone" and hasattr(act, "fill_work_identity"):
+                meta = act.fill_work_identity(ref, field) or {}
+                if not meta.get("filled"):
+                    return {"filled": False, "error": meta.get("error") or "assigned line was not filled"}
+            else:
+                reader = identity_reader
+                if reader is None:
+                    from .workidentity import resolve_identity_field
+                    reader = resolve_identity_field
+                value, meta = reader(field)
+                value = str(value or "")
+                if not value:
+                    return {"filled": False, "error": "Collie work identity is not ready for this field"}
+                act.type_ref(ref, value, submit=False)
+            return {"case": {"identity_field_filled": field}, "filled": True,
+                    "field": field, "source": str(meta.get("source") or "collie_work_identity"),
+                    "account": str(meta.get("account") or "[masked]")}
+        except Exception as exc:
+            return {"filled": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            # The local variable may briefly contain a mailbox/name, but it never enters args,
+            # Mission state, event logs or the receipt returned above.
+            if "value" in locals():
+                value = ""
+    return execute
+
+
+def _real_verification_fill(actuator, otp_reader=None):
+    def execute(rec):
+        args = rec.args or {}
+        service = str(args.get("service") or "").strip()
+        if not service:
+            return {"filled": False, "error": "expected service name is required"}
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if act is None or not hasattr(act, "snapshot") or not hasattr(act, "type_ref"):
+            return {"filled": False, "error": "connected browser is unavailable"}
+        target = act.snapshot() or {}
+        ref = _verification_field(target, args.get("field"))
+        if not ref:
+            return {"filled": False, "error": "verification-code field is missing or ambiguous"}
+        reader = otp_reader
+        if reader is None:
+            from .workidentity import take_verification_code
+            reader = take_verification_code
+        code = ""
+        try:
+            code, meta = reader(service, max_age_seconds=args.get("max_age_seconds", 600))
+            act.type_ref(ref, code, submit=False)
+            return {"case": {"verification_code_filled": True}, "filled": True,
+                    "source": meta.get("source", "connected_verification_inbox"),
+                    "account": meta.get("account", ""),
+                    "received_at": int(meta.get("received_at") or 0)}
+        except Exception as exc:
+            return {"filled": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            code = ""  # make the intended lifetime explicit; never return or persist it
+    return execute
+
+
+def _read_verify(rec, result):
+    return Verdict(VERIFIED, (result or {}).get("detail") or "observation recorded")
+
+
+def _stub_web_submit(rec):
+    a = rec.args or {}
+    ref = a.get("what") or a.get("title") or "submission"
+    url = "https://example.invalid/item/STUB-" + str(ref).lower().replace(" ", "-")[:40]
+    return {"case": {"submitted": True, "url": url}, "url": url, "what": ref}
+
+
+def _stub_submit_verify(rec, result):
+    if (result or {}).get("url"):
+        return Verdict(VERIFIED, "submitted; live per (stub) re-fetch")
+    return Verdict(FAILED, "submit produced no confirmation")
+
+
+def _stub_web_send(rec):
+    a = rec.args or {}
+    return {"case": {"sent": True, "last_sent_to": a.get("to")},
+            "to": a.get("to"), "text": a.get("text"), "sent": True}
+
+
+def _stub_send_verify(rec, result):
+    if (result or {}).get("sent"):
+        return Verdict(VERIFIED, "message sent (stub)")
+    return Verdict(FAILED, "message not sent")
+
+
+# ══════════════════════════ REAL bodies (injectable deps) ═════════════════════
+def _get_provider():
+    try:
+        from . import settings as _s
+        _s.apply()
+        name = _s.get("PROVIDER") or "mock"
+        if name == "mock":
+            return None
+        from .providers import make_provider
+        return make_provider(name, _s.get("MODEL"))
+    except Exception:
+        return None
+
+
+def _real_research(runner=None):
+    def execute(rec):
+        from .research import run_research
+        q = (rec.args or {}).get("query") or (rec.args or {}).get("goal") or ""
+        out = run_research(q, runner=runner)
+        ans = out.get("answer", "")
+        return {"case": {"researched": True, "research": ans[:600]},
+                "answer": ans, "citations": out.get("citations", []),
+                "report_file": out.get("report_file", "")}
+    return execute
+
+
+def _real_research_verify(rec, result):
+    from .research import _research_verify
+    return _research_verify(rec, result)
+
+
+_COMPOSE_REQUEST_OPEN = re.compile(
+    r"^\s*(?:please\s+)?(?:write|create|draft|produce|generate|compose|prepare|rewrite)\b",
+    re.I,
+)
+_COMPOSE_REQUEST_CUE = re.compile(
+    r"\b(?:copy|post|email|message|reply|caption|title|body|platform[- ]specific|"
+    r"publication[- ]ready|ready[- ]to[- ](?:use|publish)|must include|should be|"
+    r"do not (?:claim|invent|include))\b",
+    re.I,
+)
+_COMPOSE_REQUEST_ZH = re.compile(
+    r"^\s*(?:请|帮我)?(?:写|撰写|起草|生成|创作|准备).{0,80}"
+    r"(?:文案|帖子|邮件|消息|回复|标题|正文|可直接发布)",
+)
+
+
+def _compose_request_like(text):
+    """Recognise a writing request misplaced in ``args.text``.
+
+    ``text`` is normally a final literal, but a model can ignore the schema and
+    put "Write/Create ... copy" there.  The predicate intentionally requires a
+    writing verb *and* a meta-writing cue so legitimate slogans such as
+    "Create faster with VocalCode" remain literal copy.
+    """
+    value = str(text or "").strip()
+    return bool(
+        (_COMPOSE_REQUEST_OPEN.search(value) and _COMPOSE_REQUEST_CUE.search(value))
+        or _COMPOSE_REQUEST_ZH.search(value)
+    )
+
+
+def _real_compose(provider=None):
+    def execute(rec):
+        a = rec.args or {}
+        facts = a.get("facts") or a.get("about") or a.get("_case") or a.get("query") or ""
+        instruction = str(a.get("instruction") or "").strip()
+        prov = provider or _get_provider()
+        # ``text`` is already-final copy. Generation requests belong in
+        # ``instruction`` so the result cannot silently echo a writing request.
+        text = str(a.get("text") or "").strip()
+        if not instruction and _compose_request_like(text):
+            instruction, text = text, ""
+        should_generate = bool(instruction) or not text
+        if should_generate and prov is not None:
+            sys = ("Create the final, ready-to-use text for the user's errand. Follow the "
+                   "instruction precisely, use only the supplied facts, and stay honest. "
+                   "Return the deliverable itself in plain text with no planning notes, "
+                   "placeholders, or preamble.")
+            payload = {"facts": facts}
+            if instruction:
+                payload["instruction"] = instruction
+            if text:
+                payload["draft"] = text
+            try:
+                comp = prov.complete(
+                    sys, [{"role": "user", "content":
+                           json.dumps(payload, ensure_ascii=False)[:6000]}], [])
+                if getattr(comp, "stop_reason", "") != "error":
+                    text = (getattr(comp, "text", "") or "").strip()
+            except Exception:
+                text = ""
+        if instruction and not text:
+            return {"case": {"composed": False}, "text": "",
+                    "error": "composer could not produce the requested deliverable"}
+        if not text:                     # no model / empty -> a plain factual fallback
+            text = facts if isinstance(facts, str) else json.dumps(facts, ensure_ascii=False)
+        return {"case": {"composed": True, "draft": text}, "text": text}
+    return execute
+
+
+def _compose_verify(rec, result):
+    text = str((result or {}).get("text") or "").strip()
+    args = rec.args or {}
+    instruction = str((args.get("instruction") or "")).strip()
+    misplaced = str((args.get("text") or "")).strip()
+    if not instruction and _compose_request_like(misplaced):
+        instruction = misplaced
+    if instruction and text == instruction:
+        return Verdict(FAILED, "composer echoed the instruction instead of producing final text")
+    if instruction and _compose_request_like(text):
+        return Verdict(FAILED, "composer returned another writing request instead of final text")
+    if text:
+        return Verdict(VERIFIED, "text composed")
+    return Verdict(FAILED, "nothing composed")
+
+
+def _real_observe(actuator=None, fetch=None):
+    def execute(rec):
+        a = rec.args or {}
+        case = a.get("_case") or {}
+        n = (_int(a.get("observe_count")) or _int(case.get("observe_count")) or 0) + 1
+        url = a.get("url") or a.get("target") or ""
+        expect = (a.get("expect") or "").strip()
+        authed = bool(a.get("authed") or a.get("inbox"))
+        text, how = "", ""
+        if authed:
+            # poll an authed page (e.g. the message inbox) via the logged-in browser
+            act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+            if act is None:
+                return {"case": {"observe_count": n}, "present": None,
+                        "detail": "no browser to read the authed page"}
+            try:
+                act.open(url)
+                scope_error = _actuator_scope_error(act, a, url)
+                if scope_error:
+                    return {"case": {"observe_count": n}, "present": None,
+                            "detail": scope_error}
+                text, how = act.read(4000), "authed-browser-read"
+            except Exception as e:
+                return {"case": {"observe_count": n}, "present": None,
+                        "detail": f"authed read failed: {e}"}
+        else:
+            # independent, logged-out channel (the evidence path)
+            from .observe import fetch_loggedout
+            got = (fetch or fetch_loggedout)(url)
+            if got is None:
+                return {"case": {"observe_count": n}, "present": None,
+                        "detail": f"could not observe {url} (SSRF/transport)"}
+            _status, text = got
+            how = "logged-out-fetch"
+        present = (expect.lower() in (text or "").lower()) if expect else bool((text or "").strip())
+        return {"case": {"observe_count": n, "signal": present},
+                "present": present, "channel": how,
+                "detail": f"{how}: {'found' if present else 'not found'} "
+                          f"{('%r' % expect) if expect else ''} in {url}".strip()}
+    return execute
+
+
+def _real_web_submit(actuator=None):
+    def execute(rec):
+        a = rec.args or {}
+        url = a.get("url") or ""
+        fields = a.get("fields") or {}
+        submit_sel = a.get("submit") or a.get("submit_selector") or ""
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if act is None:
+            return {"submitted": False, "error": "no browser available (start `collie browser-bridge` and connect the extension)"}
+        try:
+            act.open(url)
+            scope_error = _actuator_scope_error(act, a, url)
+            if scope_error:
+                return {"submitted": False, "error": scope_error}
+            for sel, text in (fields.items() if isinstance(fields, dict) else []):
+                act.type(sel, text)
+            result_url = act.click(submit_sel) if submit_sel else act.current_url()
+        except Exception as e:
+            return {"submitted": False, "error": f"submit failed: {type(e).__name__}: {e}"}
+        return {"case": {"submitted": True, "url": result_url or url},
+                "submitted": True, "url": result_url or url, "published_at": time.time(),
+                "expect_title": a.get("expect_title") or a.get("title") or ""}
+    return execute
+
+
+def _real_submit_verify(rec, result):
+    r = result or {}
+    if not r.get("submitted") or not r.get("url"):
+        return Verdict(FAILED, r.get("error") or "submit did not complete")
+    # INDEPENDENT channel: a logged-out re-fetch must show the listing (observe.py).
+    from .observe import donecheck_listing
+    now = time.time()
+    return donecheck_listing(r["url"], r.get("expect_title") or "",
+                             at=now, publish_at=r.get("published_at") or (now - 1))
+
+
+def _real_web_send(actuator=None):
+    def execute(rec):
+        a = rec.args or {}
+        url = a.get("url") or ""
+        text = a.get("text") or ""
+        msg_sel = a.get("selector") or a.get("message_selector") or ""
+        send_sel = a.get("send") or a.get("send_selector") or ""
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if act is None:
+            return {"sent": False, "error": "no browser available"}
+        try:
+            if url:
+                act.open(url)
+                scope_error = _actuator_scope_error(act, a, url)
+                if scope_error:
+                    return {"sent": False, "error": scope_error}
+            if msg_sel:
+                act.type(msg_sel, text)
+            if send_sel:
+                act.click(send_sel)
+        except Exception as e:
+            return {"sent": False, "error": f"send failed: {type(e).__name__}: {e}"}
+        try:
+            page = act.read(4000) or ""
+            form = _actuator_form(act, _mission_space(getattr(rec, "job_id", "")))
+        except Exception:
+            page, form = "", []
+        want = str(a.get("success_text") or "").strip()
+        composer_still_has_text = bool(text and any(
+            str(f.get("value") or "").strip() == str(text).strip() for f in form))
+        failure = re.search(r"\b(error|failed|could not|couldn't|rate limit|try again)\b",
+                            page, re.I)
+        confirmed = bool(not failure and ((want and want.casefold() in page.casefold()) or
+                                          (text and text in page and
+                                           not composer_still_has_text)))
+        return {"case": ({"sent": True, "last_sent_to": a.get("to") or url}
+                         if confirmed else {}),
+                "sent": True, "confirmed": confirmed,
+                "to": a.get("to") or url, "text": text}
+    return execute
+
+
+def _real_send_verify(rec, result):
+    r = result or {}
+    if not r.get("sent"):
+        return Verdict(FAILED, r.get("error") or "message not sent")
+    if not r.get("confirmed"):
+        return Verdict(INCONCLUSIVE,
+                       "send click fired but a fresh thread/composer read did not confirm delivery")
+    # This proves the outgoing bubble/composer state, not that the recipient read it.
+    return Verdict(VERIFIED, "fresh thread state confirms message sent (not read)")
+
+
+def _live_actuator():
+    from .webact import get_actuator
+    return get_actuator()
+
+
+def _actuator_scope_error(act, args, requested_url=""):
+    """Validate the actual post-navigation origin before any read/type/click."""
+    try:
+        landed = urlsplit(str(act.current_url() or ""))
+        requested = urlsplit(str(requested_url or ""))
+    except Exception:
+        return "browser target identity is unavailable"
+    host = (landed.hostname or "").lower()
+    allowed = (((args or {}).get("_leash") or {}).get("allowed_domains") or [])
+    if allowed:
+        ok = any(fnmatch.fnmatchcase(host, str(p).lower()) for p in allowed)
+    else:
+        first = (requested.hostname or "").lower()
+        ok = bool(host and first and (host == first or host.endswith("." + first)))
+    return "browser redirect left the Mission domain boundary" if not ok else ""
+
+
+# ── browse: run the agent loop with the browser tools to DO a web task ───────
+# This is the bridge between the durable/gated mission and the browser agent loop
+# that actually drives obfuscated, dynamic sites (Facebook Marketplace). `browse`
+# fills/navigates (reversible, stops before any irreversible submit); `browse.submit`
+# is the single gated click that publishes/sends.
+def _browse_dir():
+    import os
+    d = os.environ.get("COLLIE_NOTES_DIR") or os.path.expanduser("~/.collie/browse")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _mission_space(job_id):
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(job_id or "standalone"))
+    return ("mission-" + safe)[:40]
+
+
+class _BoundBrowserTool:
+    """Delegate a browser tool while pinning it to a Mission tab and narrowing args."""
+    def __init__(self, inner, space, kind, name="", boundary=None):
+        self.inner, self.space, self.kind = inner, space, kind
+        self.boundary = boundary or {"domains": [], "first_host": ""}
+        self.name, self.tier = getattr(inner, "name", name), getattr(inner, "tier", "always")
+        self.description = getattr(inner, "description", "Mission-scoped browser tool")
+        schema = getattr(inner, "schema", {}) or {}
+        props = dict(schema.get("properties") or {})
+        props.pop("space", None); props.pop("adopt", None); props.pop("submit", None)
+        self.schema = dict(schema)
+        self.schema["properties"] = props
+
+    def provider_schema(self):
+        return {"name": self.name, "description": self.description,
+                "input_schema": self.schema}
+
+    def run(self, args, ctx):
+        from .browserbridge import browser_space, space_identity
+        clean = dict(args or {})
+        clean.pop("space", None); clean.pop("adopt", None)
+        if self.kind == "type":
+            clean["submit"] = False
+        domains = self.boundary.get("domains") or []
+        first = self.boundary.get("first_host") or ""
+
+        def allowed(host):
+            host = (host or "").lower()
+            if not host:
+                return True
+            if domains:
+                return any(fnmatch.fnmatchcase(host, str(p).lower()) for p in domains)
+            return not first or host == first or host.endswith("." + first)
+
+        # A previous JS navigation/redirect cannot grant the child authority on a
+        # new origin.  Refuse before read/type and suppress any off-scope result.
+        current = space_identity(self.space) or {}
+        current_host = urlsplit(str(current.get("url") or "")).hostname or ""
+        if current_host and not allowed(current_host):
+            return "ERROR(browser): live page left the Mission domain boundary"
+        if self.kind == "open":
+            u = urlsplit(str(clean.get("url") or ""))
+            if u.scheme not in ("http", "https") or not u.netloc:
+                return "ERROR(browser): Mission browse only opens http(s) pages"
+            host = (u.hostname or "").lower()
+            if domains and not allowed(host):
+                return "ERROR(browser): target domain is outside Mission leash"
+            if not domains and first and host != first and not host.endswith("." + first):
+                return "ERROR(browser): reversible browse cannot leave its first site"
+            # GET endpoints can themselves be consequential.  Activation,
+            # unsubscribe, logout and destructive links belong at an outer gated
+            # capability, not inside reversible browsing.
+            if re.search(r"(?:^|[/?&=])(?:log-?out|sign-?out|unsubscribe|delete|remove|"
+                         r"deactivate|activate|verify|confirm)(?:[/?&=]|$)",
+                         u.path + "?" + u.query, re.I):
+                return "ERROR(browser): consequential navigation requires an outer Mission gate"
+            if not first:
+                self.boundary["first_host"] = host
+                first = host
+        with browser_space(self.space):
+            out = self.inner.run(clean, ctx)
+        landed = space_identity(self.space) or {}
+        landed_host = urlsplit(str(landed.get("url") or "")).hostname or ""
+        if landed_host and not allowed(landed_host):
+            return "ERROR(browser): redirect/navigation left the Mission domain boundary"
+        return out
+
+
+def _restrict_browse_child(h, space, allowed_domains=None):
+    """Positive authority list: nothing desktop/MCP/filesystem can survive."""
+    allow = {"browser_open", "browser_read", "browser_snapshot", "browser_fields",
+             "browser_links", "browser_type", "browser_pick", "browser_advance"}
+    for name in list(h.registry._tools):
+        if name not in allow:
+            h.registry._tools.pop(name, None)
+    boundary = {"domains": list(allowed_domains or []), "first_host": ""}
+    for name in list(h.registry._tools):
+        kind = ("type" if name == "browser_type" else
+                "open" if name == "browser_open" else
+                "advance" if name == "browser_advance" else "read")
+        h.registry._tools[name] = _BoundBrowserTool(
+            h.registry._tools[name], space, kind, name, boundary)
+    return boundary
+
+
+def _live_browse(goal, space="mission-standalone", allowed_domains=None):
+    import os
+    os.environ.setdefault("COLLIE_BROWSER_BRIDGE", "1")   # drive the user's real browser via the bridge
+    from .cli import make_harness
+    from .browserbridge import space_identity
+    from . import settings as _s
+    _s.apply()
+    provider = _s.get("PROVIDER")
+    # Browser manipulation is an execution subtask, not an open-ended architecture problem.  An
+    # explicit medium effort keeps the same configured/default model but prevents provider-default
+    # deep reasoning from turning two form fields into a ten-minute run.  Both axes remain
+    # independently overridable for unusually hard sites.
+    browser_model = os.environ.get("COLLIE_BROWSE_MODEL") or _s.get("MODEL")
+    browser_effort = os.environ.get("COLLIE_BROWSE_EFFORT") or "medium"
+    h = make_harness(_browse_dir(), provider=provider, model=browser_model,
+                     project="browse", embed="hash", effort=browser_effort)
+    # Prompt text is not an authority boundary.  Keep a positive list, wrap every
+    # survivor in this Mission's isolated browser space, and force type.submit off.
+    boundary = _restrict_browse_child(h, space, allowed_domains)
+    h.self_verify = False
+    try:
+        h.force_edit = False
+    except Exception:
+        pass
+    # A Mission can issue another bounded browse step after receiving a diagnostic.  Letting one
+    # child consume 35 model turns instead made a reversible two-field fill monopolize its entire
+    # 600-second watchdog.  Eighteen is ample for multi-step forms while giving the outer planner a
+    # timely chance to repair or choose a different route.
+    try:
+        h.max_turns = max(4, min(35, int(os.environ.get("COLLIE_BROWSE_TURNS", "18"))))
+    except (TypeError, ValueError):
+        h.max_turns = 18
+    prompt = (goal.strip() + "\n\n"
+              "Act ONLY through the available reversible browser tools (browser_open / browser_snapshot / "
+              "browser_fields / browser_type with a snapshot `ref` or `label` / browser_pick / "
+              "browser_advance with an exact snapshot `ref` / browser_links / browser_read). "
+              "browser_advance may open menus, choose a non-final step, follow sign-in navigation, "
+              "or focus an editor; it refuses final submit/publish/account-creation, CAPTCHA, consent, "
+              "commerce, and destructive controls. Enter, script, and upload are unavailable; if a "
+              "consequential action is needed, stop and report its exact button so the outer Mission "
+              "can gate it. The form is DYNAMIC: picking a "
+              "value can REVEAL or CHANGE other fields (e.g. after Vehicle type, Make becomes a dropdown "
+              "and Mileage/Body-style/Condition appear).\n"
+              "WORKFLOW — repeat until complete:\n"
+              "  1. call browser_fields to list the CURRENT fields (label, kind text/richtext/dropdown, value); "
+              "if a rich editor is missing, call browser_snapshot and use its exact textbox ref;\n"
+              "  2. fill every empty one — browser_type(ref-or-label,text) for text/richtext, browser_pick(label,option) "
+              "for dropdowns;\n"
+              "  3. call browser_fields AGAIN to catch fields that just appeared or didn't take;\n"
+              "  4. keep going until EVERY field the listing needs is filled — fill ALL of them "
+              "(vehicle type, year, make, model, mileage, price, description, condition, …), do NOT stop "
+              "after the first one or two.\n"
+              "EFFICIENCY: for one or two known fields, take one fresh field/snapshot read, one fill pass, "
+              "and one verification read. Do not re-read unchanged state. If the same field fails twice, "
+              "stop and report the exact failure instead of looping.\n"
+              "CRITICAL: do NOT click any IRREVERSIBLE button (Publish, Post, Send, Pay, Place order, "
+              "Next-to-publish) — fill everything up to that point and STOP, then report each field you "
+              "filled and its final value.")
+    res = h.run("browse", prompt)
+    try:
+        h.memory.close(); h.recorder.close()
+    except Exception:
+        pass
+    answer = res.answer or res.error or ""
+    ident = space_identity(space) or {}
+    final_host = (urlsplit(str(ident.get("url") or "")).hostname or "").lower()
+    first_host = str(boundary.get("first_host") or "").lower()
+    domains = boundary.get("domains") or []
+    if domains:
+        in_scope = not final_host or any(
+            fnmatch.fnmatchcase(final_host, str(pattern).lower()) for pattern in domains)
+    else:
+        in_scope = (not final_host or not first_host or final_host == first_host or
+                    final_host.endswith("." + first_host))
+    return {"_browse_answer": answer,
+            "_scope_error": "" if in_scope else
+                "browse ended outside its single-action domain boundary (%s -> %s)" %
+                (first_host or "unknown", final_host or "unknown")}
+
+
+# Independent form re-read (the verify's ground truth): after the acting agent
+# stops, snapshot the page's fields straight from the DOM — text/textarea via
+# el.value, dropdowns via their label text (which carries the picked value). This
+# is a FRESH read, not the agent's self-report, so it can refute a "done" that
+# didn't actually fill the form.
+_FORM_SNAPSHOT = (
+    "JSON.stringify([...document.querySelectorAll('input,textarea,[role=combobox],[contenteditable]')].map(e=>{"
+    "var l=e.closest('label');var lab=l?(l.innerText||'').trim().split('\\n')[0]:(e.getAttribute('aria-label')||e.getAttribute('data-testid')||e.getAttribute('role')||e.tagName);"
+    "var val=e.getAttribute('role')==='combobox'?(l?(l.innerText||'').replace(/\\n/g,' ').trim():''):(e.value||e.innerText||'');"
+    "var meta=[lab,e.type,e.name,e.id,e.autocomplete,e.getAttribute('aria-label')].join(' ');"
+    "var sensitive=e.type==='password'||e.type==='email'||e.type==='tel'||/(pass(word|code)?|secret|token|api.?key|captcha|recaptcha|csrf|authenticity|oauth|session.?redirect|cancel.?redirect|redirect.?uri|login.?csrf|page.?instance|sid.?string|control.?id|referer|otp|one.?time|verification.?code|cvv|cvc|card.?number|ssn|social.?security|e.?mail|phone|mobile|street.?address|postal|zip.?code|birth|dob|user.?name)/i.test(meta);"
+    "return {label:lab,value:sensitive?'[redacted]':val,sensitive:!!sensitive,filled:!!val};}).filter(x=>x.label&&x.filled))")
+
+
+_SENSITIVE_FIELD = re.compile(
+    r"pass(word|code)?|secret|token|api.?key|captcha|recaptcha|csrf|authenticity|oauth|"
+    r"session.?redirect|cancel.?redirect|redirect.?uri|login.?csrf|page.?instance|"
+    r"sid.?string|control.?id|referer|"
+    r"otp|one.?time|verification.?code|"
+    r"cvv|cvc|card.?number|ssn|social.?security|e.?mail|phone|mobile|"
+    r"street.?address|postal|zip.?code|birth|dob|user.?name", re.I)
+
+
+def _sanitize_form(form):
+    """Never persist browser credentials/PII in Mission case, events or snapshots."""
+    out = []
+    for item in form if isinstance(form, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "")[:160]
+        raw = item.get("value")
+        filled = bool(item.get("filled", raw not in (None, "")))
+        sensitive = bool(item.get("sensitive") or _SENSITIVE_FIELD.search(label))
+        if not label or not filled:
+            continue
+        out.append({"label": label,
+                    "value": "[redacted]" if sensitive else str(raw or "")[:1000],
+                    **({"sensitive": True} if sensitive else {})})
+    return out
+
+
+def _read_form_state(space=""):
+    from . import browserbridge as _bb
+    try:
+        r = _bb._call({"action": "form_snapshot", "space": space} if space else
+                      {"action": "form_snapshot"})
+        data = r.get("data", r) if isinstance(r, dict) else None
+        fields = data.get("fields") if isinstance(data, dict) else []
+        actions = data.get("actions") if isinstance(data, dict) else []
+        safe_actions = [{"label": str(a.get("label") or "")[:80],
+                         "disabled": bool(a.get("disabled"))}
+                        for a in actions if isinstance(a, dict) and a.get("label")]
+        return _sanitize_form(fields or []), safe_actions[:20]
+    except Exception:
+        return [], []
+
+
+def _read_form(space=""):
+    return _read_form_state(space)[0]
+
+
+def _actuator_form(act, space):
+    if act is not None and hasattr(act, "form_snapshot"):
+        try:
+            data = act.form_snapshot() or {}
+            return _sanitize_form(data.get("fields") or [])
+        except Exception:
+            return []
+    if act is not None and hasattr(act, "eval"):
+        try:
+            data = act.eval(_FORM_SNAPSHOT)
+            return _sanitize_form(json.loads(data) if isinstance(data, str) else (data or []))
+        except Exception:
+            return []
+    return _read_form(space)
+
+
+def _locks_current_page(args):
+    """True only for an explicit read-only inspection that forbids navigation.
+
+    Domain pinning prevents cross-site drift, but an OAuth child can still guess
+    a different URL on the same host.  When the caller says CURRENT page and no
+    navigation/reload/open, bind the reversible step to the exact starting URL.
+    """
+    if not _explicit_read_only_browse(args or {}):
+        return False
+    goal = str((args or {}).get("goal") or (args or {}).get("task") or "")
+    current = bool(re.search(r"(?i)\bcurrent\b|当前|本页", goal))
+    no_nav = bool(re.search(
+        r"(?i)\bwithout\s+(?:any\s+)?(?:navigating|navigation|reloading|reload|opening)\b|"
+        r"\bdo\s+not\s+(?:navigate|reload|open)\b|"
+        r"\bno\s+(?:navigation|reload)\b|不要.{0,30}(?:导航|刷新|打开)|禁止.{0,20}(?:导航|刷新)",
+        goal))
+    return current and no_nav
+
+
+def _safe_page_name(url):
+    """Describe browser drift without persisting OAuth/query credentials."""
+    parsed = urlsplit(str(url or ""))
+    return (parsed.hostname or "") + (parsed.path or "/")
+
+
+def _redacted_page_url(url):
+    """Persist page identity without query credentials, OAuth state, or fragments."""
+    parsed = urlsplit(str(url or ""))
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return "%s://%s%s" % (parsed.scheme, parsed.netloc, parsed.path or "/")
+
+
+def _page_url_digest(url):
+    """Opaque exact-URL binding used for TOCTOU without storing the URL itself."""
+    return hashlib.sha256(str(url or "").encode("utf-8")).hexdigest()
+
+
+def _real_browse(runner=None, form_reader=None):
+    def execute(rec):
+        from .browserbridge import space_identity
+        args = rec.args or {}
+        goal = args.get("goal") or args.get("task") or ""
+        space = _mission_space(getattr(rec, "job_id", ""))
+        domains = (args.get("_leash") or {}).get("allowed_domains") or []
+        lock_current = _locks_current_page(args)
+        start_ident = (space_identity(space) or {}) if lock_current and runner is None else {}
+        start_url = str(start_ident.get("url") or "")
+        # The restricted browser child receives only this goal, never the outer Mission case.  A
+        # planner instruction such as "use the prepared copy from the case" therefore forces the
+        # child to invent the missing body.  Refuse before touching the browser unless every
+        # expected value is literally embedded in the self-contained payload.
+        if not _explicit_read_only_browse(args):
+            expect = args.get("expect") or {}
+            flat_goal = re.sub(r"\s+", " ", str(goal)).strip().casefold()
+            missing = [str(k) for k, v in expect.items()
+                       if re.sub(r"\s+", " ", str(v)).strip().casefold() not in flat_goal]
+            case_ref = re.search(
+                r"(?i)\b(?:from|in|use)\s+(?:the\s+)?(?:case(?:\s+draft)?|draft|context|"
+                r"previous\s+(?:message|result)|above)\b|"
+                r"(?:case|草稿|上下文|上文).{0,20}(?:copy|text|body|文案|正文)", str(goal))
+            if missing or case_ref:
+                reason = ("browse payload is not self-contained: embed the complete exact value for "
+                          + (", ".join(missing) if missing else "every referenced case/draft field")
+                          + " in args.goal and args.expect")
+                return {"case": {"browsed": False, "browse_result": reason[:600]},
+                        "result": reason, "form": [], "form_actions": [], "page": {},
+                        "contract_error": reason}
+        raw_out = runner(goal) if runner else _live_browse(goal, space, domains)
+        scope_error = ""
+        if isinstance(raw_out, dict) and "_browse_answer" in raw_out:
+            out = raw_out.get("_browse_answer") or ""
+            scope_error = str(raw_out.get("_scope_error") or "")
+        else:
+            out = raw_out
+        # Child summaries are durable case/event material.  Defense in depth for
+        # a child that ignored the prompt and echoed signup/contact credentials.
+        out = str(out or "")
+        out = re.sub(r"(?i)((?:password|passcode|secret|token|otp|e-?mail|phone|"
+                     r"card(?: number)?)\s*(?:is|=|:)\s*)\S+", r"\1[redacted]", out)
+        out = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+                     "[redacted-email]", out, flags=re.I)
+        if form_reader:
+            form, form_actions = _sanitize_form(form_reader()), []
+        else:
+            form, form_actions = _read_form_state(space)
+        # Page identity is evidence too.  A platform/site is not an HTML form
+        # field, and treating it as one produced impossible contracts such as
+        # expect={platform: Twitter/X}.  Keep only origin-level identity and a
+        # bounded title; query strings/fragments may carry credentials or PII.
+        ident = (space_identity(space) or {}) if runner is None else {}
+        end_url = str(ident.get("url") or "")
+        if lock_current and start_url and end_url and end_url != start_url:
+            locked_error = (
+                "read-only current-page browse navigated away from its locked URL "
+                "(%s -> %s)" % (_safe_page_name(start_url), _safe_page_name(end_url)))
+            scope_error = scope_error or locked_error
+        parsed = urlsplit(str(ident.get("url") or ""))
+        page = {"host": (parsed.hostname or "").lower(),
+                "title": str(ident.get("title") or "")[:160]}
+        return {"case": {"browsed": True, "browse_result": (out or "")[:600]},
+                "result": out, "form": form, "form_actions": form_actions,
+                "page": page, **({"scope_error": scope_error} if scope_error else {})}
+    return execute
+
+
+def _explicit_read_only_browse(args):
+    """Recognize only an unmistakable no-write inspection request.
+
+    The explicit boolean is the primary contract.  The narrow language fallback
+    exists because planners can omit an optional JSON field even while spelling
+    out "inspect; do not change or submit anything" in the goal.  Requiring both
+    a read verb and a no-write clause keeps ordinary failed form fills outside
+    this path.
+    """
+    a = args or {}
+    # An explicit false is just as meaningful as true. Falling through to the
+    # heuristic let a failed form fill masquerade as a verified inspection.
+    if "read_only" in a:
+        return a.get("read_only") is True
+    goal = str(a.get("goal") or a.get("task") or "")
+    read_intent = bool(re.search(
+        r"(?i)\b(inspect|review|check|identify|read|observe|audit|look\s+at)\b|"
+        r"查看|检查|核实|审查|识别", goal))
+    no_write = bool(re.search(
+        r"(?i)\bread[- ]only\b|\bwithout\s+(?:making\s+)?(?:changes?|changing|"
+        r"submitting|posting|publishing|sending|editing|filling|clicking)\b|"
+        r"\bdo\s+not\s+(?:register|message|change|create|submit|post|publish|send|"
+        r"edit|fill|click)\b|只读|不要.{0,80}(?:修改|提交|发布|注册|发送|创建|填写|点击)",
+        goal))
+    # Planners naturally produce composite clauses such as "without navigating,
+    # reloading, opening, clicking, typing, or submitting".  The old expression
+    # only recognized the first word after ``without`` and therefore treated
+    # semantic page expectations as form fields whenever ``read_only`` was
+    # omitted.  Require an actual mutation verb later in the same bounded clause;
+    # "without navigating" alone is deliberately not enough, because a caller
+    # could still intend to fill the current page.
+    composite_no_write = bool(re.search(
+        r"(?is)\bwithout\b[^.\n]{0,180}\b(?:submitting|posting|publishing|sending|"
+        r"editing|filling|clicking|typing|changing|creating|registering)\b",
+        goal))
+    return read_intent and (no_write or composite_no_write)
+
+
+def _browse_verify(rec, result):
+    """Done-check by an INDEPENDENT re-read of the form, not the agent's self-report.
+    If the caller passed `expect` ({label: value}), assert each value is actually
+    present in the re-read form (differential); otherwise confirm the form is
+    substantially filled. A 'done' over an empty form is refuted here."""
+    r = result or {}
+    form = r.get("form") or []
+    expect = (rec.args or {}).get("expect") or {}
+    read_only = _explicit_read_only_browse(rec.args or {})
+    if r.get("scope_error"):
+        return Verdict(FAILED, str(r.get("scope_error"))[:300])
+    if r.get("contract_error"):
+        return Verdict(FAILED, str(r.get("contract_error"))[:300])
+    if not r.get("result") and not form:
+        return Verdict(FAILED, "browse produced no result")
+
+    # A deliberate inspection/navigation action has no form to fill.  It still
+    # needs independent evidence: the bridge re-read of the live page identity.
+    # Without the explicit flag, an empty form remains inconclusive so a failed
+    # fill cannot disguise itself as successful browsing.
+    # ``expect`` has form-fill semantics.  A planner can still attach semantic
+    # inspection goals such as {account: "authenticated identity"}; those are
+    # not labels/values that should suddenly turn an explicit no-write read
+    # into a failed form submission.  Explicit read-only intent wins, and the
+    # independent evidence remains the freshly reread page origin below.
+    if read_only:
+        page = r.get("page") or {}
+        host = str(page.get("host") or "").strip().lower()
+        title = str(page.get("title") or "").strip()
+        if not host:
+            return Verdict(INCONCLUSIVE,
+                           "read-only browse returned no independently confirmed page")
+        ev = Observation(channel="browser-page-reread", at=1, ok=True, asserted=True,
+                         detail=(host + ((" · " + title) if title else "")))
+        return Verdict(VERIFIED, "independently confirmed read-only browse on " + host, (ev,))
+
+    def _norm(s):                                    # ignore $, commas, spacing ("9500" == "$9,500")
+        return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+    def _present(label, val):
+        lab, v = str(label).lower(), _norm(val)
+        return bool(v) and any(lab in str(f.get("label", "")).lower() and v in _norm(f.get("value", ""))
+                               for f in form)
+
+    def _value_present(val):
+        v = _norm(val)
+        return bool(v) and any(v in _norm(f.get("value", "")) for f in form)
+
+    def _value_exact(val):
+        v = _norm(val)
+        return bool(v) and any(v == _norm(f.get("value", "")) for f in form)
+
+    def _page_present(val):
+        page = r.get("page") or {}
+        wanted = _norm(val)
+        actual = _norm("%s %s" % (page.get("host", ""), page.get("title", "")))
+        if wanted and wanted in actual:
+            return True
+        # Twitter and X are one platform but neither spelling is a substring of
+        # the other.  The evidence remains the independently read x.com host.
+        return wanted in ("x", "twitter", "twitterx") and (
+            str(page.get("host") or "").lower() == "x.com" or
+            str(page.get("host") or "").lower().endswith(".x.com"))
+
+    def _expected_present(label, val):
+        key = re.sub(r"[^a-z0-9_]", "", str(label).lower())
+        if key in ("platform", "site", "origin"):
+            return _page_present(val)
+        # Rich editors expose unstable accessibility labels/data-testid values
+        # (e.g. tweetTextarea_0).  Semantic *_text/body/content expectations are
+        # verified against the fresh value of every filled editor, not a guessed
+        # label, while ordinary form fields retain strict label+value matching.
+        if key in ("text", "title", "body", "content", "message", "tweet_text", "post_text") or key.endswith("_text"):
+            # A prefix proves only that the child started the requested copy.  It does not prove the
+            # rest was preserved rather than invented (including links).  Rich/social payloads are
+            # externally consequential, so verify the complete normalized value exactly.
+            return _value_exact(val)
+        return _present(label, val)
+
+    if expect:
+        missing = [k for k, v in expect.items() if not _expected_present(k, v)]
+        if missing:
+            return Verdict(FAILED, "form fields NOT confirmed filled: " + ", ".join(missing))
+        final_actions = [a for a in (r.get("form_actions") or [])
+                         if str(a.get("label") or "").lower() in
+                         ("post", "publish", "send", "submit", "save", "next", "continue")]
+        if final_actions and not any(not a.get("disabled") for a in final_actions):
+            return Verdict(FAILED, "form is filled but final action remains disabled: " +
+                           ", ".join(str(a.get("label")) for a in final_actions))
+        ev = Observation(channel="form-reread", at=1, ok=True, asserted=True,
+                         detail="; ".join("%s=%s" % (k, v) for k, v in expect.items()))
+        return Verdict(VERIFIED, "independently confirmed %d field(s) filled" % len(expect), (ev,))
+    # no expected values -> at least confirm the form is substantially filled
+    if len(form) >= 3:
+        return Verdict(VERIFIED, "form re-read shows %d filled field(s)" % len(form))
+    return Verdict(INCONCLUSIVE,
+                   "could not confirm the form was filled (re-read found %d field(s))" % len(form))
+
+
+def _space_actuator(actuator, job_id):
+    act = actuator or _live_actuator()
+    if act is not None and hasattr(act, "for_space"):
+        act = act.for_space(_mission_space(job_id))
+    return act
+
+
+_FINAL_BUTTON_EQUIVALENTS = (
+    # The browser tree exposes the page's locale, while the planning model may describe the same
+    # final action in the user's language, in English, or as a bilingual label ("保存 / Save").
+    # Keep this deliberately limited to common final-action verbs.  `_find_button` still requires
+    # one unique enabled live button, so translation never turns a vague label into a guessed click.
+    frozenset(("save", "save changes", "保存", "保存更改", "guardar", "enregistrer",
+               "speichern", "salva", "opslaan", "zapisz", "сохранить", "저장", "kaydet",
+               "lưu", "บันทึก", "simpan")),
+    frozenset(("publish", "发布", "發佈", "publier", "veröffentlichen", "publicar",
+               "pubblica", "publiceren", "opublikuj", "опубликовать", "公開", "게시",
+               "yayınla")),
+    frozenset(("post", "发帖", "發文", "投稿", "게시하기")),
+    frozenset(("send", "发送", "傳送", "envoyer", "senden", "enviar", "invia",
+               "verzenden", "wyślij", "отправить", "送信", "보내기", "gönder")),
+    frozenset(("submit", "提交", "送出", "soumettre", "absenden", "enviar",
+               "invia", "indienen", "prześlij", "отправить", "送信", "제출")),
+)
+
+
+def _button_labels(button):
+    raw = str(button or "").strip().casefold()
+    # A bilingual description is not normally the DOM's literal accessible name.  Treat each side
+    # as a semantic hint, but never as permission to match arbitrary substrings.
+    parts = {p.strip() for p in re.split(r"\s*(?:/|｜)\s*", raw) if p.strip()}
+    exact = {raw} if raw else set()
+    semantic = set(parts)
+    seeds = set(parts)
+    for group in _FINAL_BUTTON_EQUIVALENTS:
+        if seeds.intersection(group):
+            semantic.update(group)
+    return exact, semantic
+
+
+def _find_button(snapshot, button, include_disabled=False):
+    exact, semantic = _button_labels(button)
+    hits = []
+    for line in str((snapshot or {}).get("snapshot") or "").splitlines():
+        m = re.search(r"\[([^\]]+)\]\s+(button|link|menuitem)\s+\"([^\"]+)\"", line)
+        label = m.group(3).strip().casefold() if m else ""
+        if m and label in semantic:
+            if re.search(r"×\s*[2-9]\d*|identical siblings", line, re.I):
+                return None
+            hits.append({"ref": m.group(1), "role": m.group(2),
+                         "label": label,
+                         "line": line.strip(),
+                         "disabled": bool(re.search(r"\(disabled\)|\[disabled\]|aria-disabled", line, re.I))})
+    buttons = [h for h in hits if h["role"] in ("button", "menuitem")]
+    exact_buttons = [h for h in buttons if h["label"] in exact]
+    if exact_buttons:
+        enabled = [h for h in exact_buttons if not h["disabled"]]
+        if len(enabled) == 1:
+            return enabled[0]
+        if include_disabled and len(exact_buttons) == 1:
+            return exact_buttons[0]
+        return None
+    if buttons:
+        enabled = [h for h in buttons if not h["disabled"]]
+        if len(enabled) == 1:
+            return enabled[0]
+        if include_disabled and len(buttons) == 1:
+            return buttons[0]
+        return None
+    exact_links = [h for h in hits if h["role"] == "link" and h["label"] in exact
+                   and not h["disabled"]]
+    if exact_links:
+        return exact_links[0] if len(exact_links) == 1 else None
+    links = [h for h in hits if h["role"] == "link" and not h["disabled"]]
+    return links[0] if len(links) == 1 else None
+
+
+def _browse_target_snapshot(actuator):
+    def snap(args, job_id):
+        button = (args or {}).get("button") or (args or {}).get("text") or "Publish"
+        if re.search(r"\b(pay|purchase|buy|checkout|place\s+order)\b",
+                     str(button), re.I):
+            raise RuntimeError("commerce requires a dedicated pay capability with a bound amount")
+        act = _space_actuator(actuator, job_id)
+        if act is None or not hasattr(act, "page_identity") or not hasattr(act, "snapshot"):
+            raise RuntimeError("cannot snapshot the browser target")
+        if hasattr(act, "show"):
+            act.show()
+        ident = act.page_identity() or {}
+        tree, target = {}, None
+        # GitHub and some other consent pages intentionally render the final
+        # control disabled for a short safety delay.  A one-shot snapshot made
+        # a valid, already verified target look missing and sent the Mission
+        # back through planning.  Re-read only when the exact unique target is
+        # present-but-disabled; ambiguity and true absence still fail at once.
+        for attempt in range(4):
+            tree = act.snapshot() or {}
+            target = _find_button(tree, button)
+            if target:
+                break
+            pending = _find_button(tree, button, include_disabled=True)
+            if not pending or not pending.get("disabled") or attempt >= 3:
+                break
+            time.sleep(1)
+        full_url = tree.get("url") or ident.get("url")
+        if not full_url or not target:
+            raise RuntimeError("target page/button is missing or ambiguous; prepare the page again")
+        u = urlsplit(str(full_url or ""))
+        form = _actuator_form(act, _mission_space(job_id))
+        form_json = json.dumps(form, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":"))
+        return {"space": _mission_space(job_id), "tab_id": ident.get("tab_id"),
+                "title": ident.get("title") or "", "url": _redacted_page_url(full_url),
+                "url_digest": _page_url_digest(full_url),
+                "origin": "%s://%s" % (u.scheme, u.netloc),
+                "button": str(button), "ref": target["ref"],
+                "target": target["line"],
+                "form_digest": hashlib.sha256(form_json.encode("utf-8")).hexdigest(),
+                "form": form[:20]}
+    return snap
+
+
+def _browse_target_unchanged(actuator):
+    def unchanged(rec):
+        old = rec.snapshot or {}
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if act is None:
+            return False
+        if hasattr(act, "show"):
+            act.show()
+        ident = act.page_identity() or {}
+        tree = act.snapshot() or {}
+        target = _find_button(tree, old.get("button"))
+        full_url = tree.get("url") or ident.get("url")
+        form = _actuator_form(act, _mission_space(getattr(rec, "job_id", "")))
+        form_json = json.dumps(form, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":"))
+        form_digest = hashlib.sha256(form_json.encode("utf-8")).hexdigest()
+        url_matches = (_page_url_digest(full_url) == old.get("url_digest")
+                       if old.get("url_digest") else full_url == old.get("url"))
+        return bool(target and ident.get("tab_id") == old.get("tab_id") and
+                    url_matches and
+                    target.get("line") == old.get("target") and
+                    target.get("ref") == old.get("ref") and
+                    form_digest == old.get("form_digest"))
+    return unchanged
+
+
+def _real_browse_submit(actuator=None):
+    def execute(rec):
+        button = (rec.args or {}).get("button") or (rec.args or {}).get("text") or "Publish"
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if act is None:
+            return {"submitted": False, "error": "no browser available"}
+        try:
+            ref = (getattr(rec, "snapshot", None) or {}).get("ref")
+            if not ref or not hasattr(act, "click_ref"):
+                return {"submitted": False, "error": "approved button identity is missing"}
+            if hasattr(act, "trusted_click_ref"):
+                act.trusted_click_ref(ref)
+            else:
+                act.click_ref(ref)
+        except Exception as e:
+            return {"submitted": False, "error": "publish click failed: %s: %s" % (type(e).__name__, e)}
+        old = getattr(rec, "snapshot", None) or {}
+        success_text = str((rec.args or {}).get("success_text") or "").strip()
+        success_url = str((rec.args or {}).get("success_url_contains") or "").strip()
+        confirmed, new_url, last_error = False, "", ""
+        # A trusted click can return before an OAuth redirect or SPA success
+        # state lands.  Re-observe the page for a short bounded window; never
+        # click again.  This converts a real success from "inconclusive" without
+        # weakening the evidence requirement.
+        for attempt in range(5):
+            try:
+                ident = act.page_identity() or {}
+                tree = act.snapshot() or {}
+            except Exception as e:
+                last_error = "clicked, but fresh postcondition read failed: %s" % e
+                tree, ident = {}, {}
+            new_url = str(tree.get("url") or ident.get("url") or "")
+            page = "\n".join((str(ident.get("title") or ""),
+                               str(tree.get("snapshot") or "")))
+            failure = re.search(r"\b(error|required|could not|couldn't|failed|captcha|"
+                                r"rate limit|try again|something went wrong)\b", page, re.I)
+            explicit = ((success_text and success_text.casefold() in page.casefold()) or
+                        (success_url and success_url in new_url))
+            marker = re.search(r"\b(published|posted|sent successfully|your post is live|"
+                               r"view post|successfully published)\b", page, re.I)
+            target_gone = _find_button(tree, old.get("button")) is None
+            navigated = bool(new_url and (
+                _page_url_digest(new_url) != old.get("url_digest")
+                if old.get("url_digest") else new_url != str(old.get("url") or "")))
+            permalink = re.search(
+                r"/(?:posts?|status|items?|listings?|p|reels?|videos?|updates?)/[^/?#]+",
+                urlsplit(new_url).path, re.I) if new_url else None
+            confirmed = bool(not failure and (((explicit or marker) and
+                                                (navigated or target_gone)) or
+                                               (permalink and navigated and target_gone)))
+            if confirmed or attempt >= 4:
+                break
+            if hasattr(act, "wait"):
+                act.wait(0.75)
+            else:
+                time.sleep(0.75)
+        return {"case": {"published": True} if confirmed else {},
+                "submitted": True, "confirmed": confirmed, "button": button,
+                "target": _redacted_page_url(new_url),
+                "error": last_error if not confirmed and last_error else "",
+                "postcondition":
+                    ("fresh success state observed" if confirmed else
+                     "click fired; no fresh publication evidence")}
+    return execute
+
+
+def _browse_submit_verify(rec, result):
+    r = result or {}
+    if not r.get("submitted"):
+        return Verdict(FAILED, r.get("error") or "publish click did not fire")
+    if not r.get("confirmed"):
+        return Verdict(INCONCLUSIVE,
+                       r.get("error") or "click fired but publication was not independently observed")
+    return Verdict(VERIFIED, "fresh page state confirms %r completed" % r.get("button"))
+
+
+def _account_submit_snapshot(actuator, registry_factory=None):
+    base_snapshot = _browse_target_snapshot(actuator)
+
+    def snap(args, job_id):
+        args = args or {}
+        account_id = str(args.get("account_id") or "").strip()
+        step = str(args.get("step") or "registration").strip().lower()
+        active_text = " ".join(str(args.get("active_text") or "").split())
+        active_path = str(args.get("active_path") or "").strip()
+        if not account_id or len(account_id) > 256:
+            raise RuntimeError("a bounded account_id is required")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", step):
+            raise RuntimeError("account submission step must be a safe bounded label")
+        act = _space_actuator(actuator, job_id)
+        if (act is None or not hasattr(act, "is_collie_profile")
+                or not act.is_collie_profile()):
+            raise RuntimeError("account submission requires Collie's isolated managed browser profile")
+        bound = base_snapshot(args, job_id)
+        registry = _account_registry(registry_factory)
+        try:
+            account = registry.get(account_id)
+            if account.get("status") not in {"registering", "challenge_wait"}:
+                raise RuntimeError("account is not in a submittable registration state")
+            from .accounts import normalize_origin
+            if normalize_origin(bound.get("origin") or "") != account.get("origin"):
+                raise RuntimeError("current page origin does not match the prepared account")
+            # Validate the final postcondition before it becomes part of the
+            # action snapshot. AccountRegistry applies the same validation in
+            # begin_submission; neither value can be invented after the click.
+            generic = {"account", "account active", "active", "dashboard", "home",
+                       "success", "welcome", "done", "complete", "completed"}
+            if (len(active_text) < 12 or active_text.casefold() in generic
+                    or len(set(re.findall(r"[A-Za-z0-9\u0080-\uffff]", active_text))) < 6):
+                raise RuntimeError("active_text must be a specific visible final postcondition")
+            if (not active_path.startswith("/") or active_path == "/" or len(active_path) < 4
+                    or "?" in active_path or "#" in active_path or ".." in active_path):
+                raise RuntimeError("active_path must be a specific query-free absolute path")
+            fresh_tree = act.snapshot() or {}
+            fresh_ident = act.page_identity() if hasattr(act, "page_identity") else {}
+            fresh_ident = fresh_ident or {}
+            pre_visible = "\n".join((str(fresh_ident.get("title") or ""),
+                                      str(fresh_tree.get("snapshot") or "")))
+            if _canonical_visible_text(active_text) in _canonical_visible_text(pre_visible):
+                raise RuntimeError(
+                    "active_text must be absent before submit so it can prove a fresh transition")
+            pre_url = str(fresh_tree.get("url") or fresh_ident.get("url") or "")
+            pre_path = urlsplit(pre_url).path or "/"
+            page_state = json.dumps({
+                "url": pre_url,
+                "title": str(fresh_ident.get("title") or ""),
+                "snapshot": str(fresh_tree.get("snapshot") or ""),
+            }, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            # These public fields are intentionally MAC-bound into the exact
+            # approval/action snapshot.  No vault ref or credential is included.
+            bound.update({
+                "account_id": account_id,
+                "account_origin": account.get("origin"),
+                "account_username": account.get("username"),
+                "account_ownership": account.get("ownership"),
+                "account_legal_principal": account.get("legal_principal"),
+                "step": step,
+                "active_text": active_text,
+                "active_path": active_path,
+                "pre_path": pre_path,
+                "pre_state_digest": hashlib.sha256(page_state.encode("utf-8")).hexdigest(),
+            })
+            return bound
+        finally:
+            registry.close()
+    return snap
+
+
+def _account_submit_unchanged(actuator, registry_factory=None):
+    base_unchanged = _browse_target_unchanged(actuator)
+
+    def unchanged(rec):
+        old = rec.snapshot or {}
+        account_id = str(old.get("account_id") or "")
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if (not account_id or act is None or not hasattr(act, "is_collie_profile")
+                or not act.is_collie_profile() or not base_unchanged(rec)):
+            return False
+        registry = _account_registry(registry_factory)
+        try:
+            account = registry.get(account_id)
+            return bool(
+                account.get("status") in {"registering", "challenge_wait"}
+                and account.get("origin") == old.get("account_origin")
+                and account.get("username") == old.get("account_username")
+                and account.get("ownership") == old.get("account_ownership")
+                and account.get("legal_principal") == old.get("account_legal_principal"))
+        except Exception:
+            return False
+        finally:
+            registry.close()
+    return unchanged
+
+
+def _real_account_submit(actuator, registry_factory=None):
+    submit = _real_browse_submit(actuator)
+
+    def execute(rec):
+        account_id = str((rec.args or {}).get("account_id") or "").strip()
+        step = str((rec.args or {}).get("step") or "registration").strip().lower()
+        registry = None
+        try:
+            registry = _account_registry(registry_factory)
+            account = registry.get(account_id)
+            if account.get("status") not in {"registering", "challenge_wait"}:
+                return {"submitted": False, "error": "account is not ready for registration submit"}
+            bound = getattr(rec, "snapshot", None) or {}
+            registry.begin_submission(
+                account_id, step=step,
+                expected_active_text=bound.get("active_text") or "",
+                expected_active_path=bound.get("active_path") or "",
+                pre_state_digest=bound.get("pre_state_digest") or "")
+            result = submit(rec) or {}
+            current = registry.settle_submission(
+                account_id, step=step, fired=bool(result.get("submitted")),
+                confirmed=bool(result.get("confirmed")))
+            result.update({
+                "account_id": account_id,
+                "status": current.get("status"),
+                "account_origin": current.get("origin"),
+                "account_username": current.get("username"),
+            })
+            result["case"] = {"account_registration": {
+                "account_id": account_id, "origin": current.get("origin"),
+                "status": current.get("status")}}
+            return result
+        except Exception as exc:
+            return {"submitted": False, "account_id": account_id,
+                    "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            if registry is not None:
+                registry.close()
+    return execute
+
+
+def _account_submit_verify(rec, result):
+    verdict = _browse_submit_verify(rec, result)
+    if verdict.status == VERIFIED:
+        return Verdict(
+            VERIFIED,
+            "registration step submitted from the bound Collie account; fresh next-step state observed",
+            verdict.evidence)
+    return verdict
+
+
+def _real_account_complete(actuator, registry_factory=None):
+    """Mark a registry row active only from fresh same-origin visible evidence."""
+    def execute(rec):
+        args = rec.args or {}
+        account_id = str(args.get("account_id") or "").strip()
+        if not account_id or len(account_id) > 256:
+            return {"completed": False, "error": "a bounded account_id is required"}
+        act = _space_actuator(actuator, getattr(rec, "job_id", ""))
+        if (act is None or not hasattr(act, "snapshot")
+                or not hasattr(act, "is_collie_profile") or not act.is_collie_profile()):
+            return {"completed": False,
+                    "error": "account completion requires Collie's isolated managed browser profile"}
+        registry = None
+        try:
+            from .accounts import normalize_origin
+            registry = _account_registry(registry_factory)
+            account = registry.get(account_id)
+            if account.get("status") not in {"challenge_wait", "active"}:
+                return {"completed": False,
+                        "error": "account has no submitted registration to complete"}
+            contract = registry.submission_contract(account_id)
+            expect = str(contract.get("expected_active_text") or "")
+            path_marker = str(contract.get("expected_active_path") or "")
+            if not expect or not path_marker or not contract.get("submission_started_at"):
+                return {"completed": False,
+                        "error": "account has no pre-submit bound completion contract"}
+            tree = act.snapshot() or {}
+            ident = act.page_identity() if hasattr(act, "page_identity") else {}
+            ident = ident or {}
+            full_url = str(tree.get("url") or ident.get("url") or "")
+            parsed = urlsplit(full_url)
+            origin = normalize_origin("%s://%s" % (parsed.scheme, parsed.netloc))
+            if origin != account.get("origin"):
+                return {"completed": False,
+                        "error": "current page origin does not match the prepared account"}
+            visible = "\n".join((str(ident.get("title") or ""),
+                                   str(tree.get("snapshot") or "")))
+            if (expect and _canonical_visible_text(expect)
+                    not in _canonical_visible_text(visible)):
+                return {"completed": False, "error": "visible success marker was not found"}
+            if (parsed.path or "/") != path_marker:
+                return {"completed": False,
+                        "error": "current URL path does not exactly match the bound success path"}
+            if re.search(r"\b(captcha|verification code|required|failed|error|try again)\b",
+                         visible, re.I):
+                return {"completed": False,
+                        "error": "page still shows a challenge or failure state"}
+            page_state = json.dumps({"url": full_url,
+                                     "title": str(ident.get("title") or ""),
+                                     "snapshot": str(tree.get("snapshot") or "")},
+                                    sort_keys=True, ensure_ascii=False,
+                                    separators=(",", ":"))
+            evidence_digest = hashlib.sha256(page_state.encode("utf-8")).hexdigest()
+            account = registry.complete_submission(
+                account_id, evidence_digest=evidence_digest)
+            if account.get("status") != "active":
+                return {"completed": False, "account_id": account_id,
+                        "error": "account activation did not commit"}
+            return {"case": {"account_registration": {
+                        "account_id": account_id, "origin": account.get("origin"),
+                        "status": "active"}},
+                    "completed": True, "account_id": account_id, "status": "active",
+                    "origin": account.get("origin"),
+                    "evidence_hash": evidence_digest}
+        except Exception as exc:
+            return {"completed": False, "account_id": account_id,
+                    "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            if registry is not None:
+                registry.close()
+    return execute
+
+
+def _account_complete_verify(rec, result):
+    if (result or {}).get("completed") and (result or {}).get("status") == "active":
+        return Verdict(VERIFIED, "fresh same-origin account-active evidence recorded")
+    return Verdict(FAILED, (result or {}).get("error") or "account activation was not confirmed")
+
+
+def _real_account_abort(registry_factory=None):
+    def execute(rec):
+        account_id = str((rec.args or {}).get("account_id") or "").strip()
+        if not account_id or len(account_id) > 256:
+            return {"aborted": False, "error": "a bounded account_id is required"}
+        registry = None
+        try:
+            registry = _account_registry(registry_factory)
+            receipt = registry.abort_prepared(account_id)
+            return {"aborted": True, "account_id": account_id,
+                    "event": receipt.get("event"),
+                    "factor_classes": receipt.get("factor_classes") or []}
+        except Exception as exc:
+            return {"aborted": False, "account_id": account_id,
+                    "error": "%s: %s" % (type(exc).__name__, exc)}
+        finally:
+            if registry is not None:
+                registry.close()
+    return execute
+
+
+def _account_abort_verify(rec, result):
+    if (result or {}).get("aborted"):
+        return Verdict(VERIFIED, "local-only account preparation and vault credentials were removed")
+    return Verdict(FAILED, (result or {}).get("error") or "account preparation was not aborted")
+
+
+def _stub_browse(rec):
+    goal = (rec.args or {}).get("goal") or ""
+    # a canned re-read so the (real) _browse_verify has a form to check against
+    form = [{"label": "Make", "value": "Toyota"}, {"label": "Model", "value": "Corolla"},
+            {"label": "Price", "value": "$9,500"}]
+    return {"case": {"browsed": True}, "result": "(stub) filled the form for: " + goal[:60],
+            "form": form}
+
+
+def _stub_browse_submit(rec):
+    return {"case": {"published": True}, "submitted": True, "confirmed": True,
+            "button": (rec.args or {}).get("button") or "Publish"}
+
+
+# ── code: coding is a capability like any other — run collie's coding agent ───
+# The delegate's positioning is a human-delegate; coding is ONE function under it.
+# `code` runs a filesystem-confined read/edit/search loop. General command execution
+# stays unavailable inside Mission; a real edit therefore hands off as INCONCLUSIVE
+# unless an injected, separately sandboxed runner supplies executed verification.
+class _BoundCodeTool:
+    """Confine every path-bearing code tool to one approved real workspace."""
+    def __init__(self, inner, root, path_key="path", default_path=None):
+        self.inner, self.root = inner, os.path.realpath(root)
+        self.path_key, self.default_path = path_key, default_path
+        self.name, self.tier = inner.name, getattr(inner, "tier", "always")
+        self.description = getattr(inner, "description", "Mission-scoped code tool")
+        self.schema = getattr(inner, "schema", {}) or {}
+
+    def provider_schema(self):
+        return {"name": self.name, "description": self.description,
+                "input_schema": self.schema}
+
+    def run(self, args, ctx):
+        clean = dict(args or {})
+        raw = clean.get(self.path_key, self.default_path)
+        if raw is None:
+            return "ERROR(code): path is required"
+        try:
+            raw = str(raw)
+            candidate = os.path.realpath(raw if os.path.isabs(raw)
+                                         else os.path.join(self.root, raw))
+            if os.path.commonpath([self.root, candidate]) != self.root:
+                return "ERROR(code): path is outside the approved Mission workspace"
+        except (OSError, ValueError):
+            return "ERROR(code): invalid or cross-volume path"
+        clean[self.path_key] = candidate
+        return self.inner.run(clean, ctx)
+
+
+def _restrict_code_child(h, root):
+    # `glob` can traverse directory symlinks and general shell/execute tools can
+    # escape any path wrapper. code_search already provides safe repo discovery.
+    allow = {"read_file", "write_file", "edit_file", "grep",
+             "plan", "undo", "code_search"}
+    for name in list(h.registry._tools):
+        if name not in allow:
+            h.registry._tools.pop(name, None)
+    for name in ("read_file", "write_file", "edit_file"):
+        if name in h.registry._tools:
+            h.registry._tools[name] = _BoundCodeTool(h.registry._tools[name], root)
+    if "grep" in h.registry._tools:
+        h.registry._tools["grep"] = _BoundCodeTool(
+            h.registry._tools["grep"], root, default_path=".")
+
+
+def _code_session_id(mission_id, workspace):
+    material = str(mission_id or workspace or "mission-code")
+    return "mission-code-" + hashlib.sha256(
+        material.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def _default_code_verifier(workspace, result, command="", baseline_digest="",
+                           timeout_seconds=300, *, patch_attributed=False,
+                           agent_post_tree_digest=""):
+    """Run one exact, pre-authorized host check and bind it to current bytes."""
+    command = str(command or "").strip()
+    if not command:
+        return {"verified": bool(getattr(result, "verified", False)),
+                "detail": "no host verification command configured", "evidence": None}
+    from .verification import run_verification_command
+    evidence = run_verification_command(
+        command, workspace, timeout=max(1, min(3600, int(timeout_seconds or 300))),
+        source="mission_code_profile", after_last_edit=True)
+    # The verifier is allowed to execute repository code and can therefore
+    # create files of its own (for example __pycache__, coverage data, or build
+    # output).  Those bytes are part of the physical workspace boundary, but
+    # they are not evidence that the coding agent produced a patch.  Bind the
+    # check to the snapshot captured immediately after the agent loop, and use
+    # only durable agent/reconciliation provenance for patch attribution.
+    agent_boundary = str(agent_post_tree_digest or "")
+    boundary_matches = bool(
+        agent_boundary and str(evidence.get("tree_digest") or "") == agent_boundary)
+    evidence["agent_post_tree_digest"] = agent_boundary
+    evidence["agent_boundary_matches"] = boundary_matches
+    # Provenance is about bytes that still exist, not whether an agent changed
+    # something at any earlier point in the Mission.  A later slice may cleanly
+    # revert the prior patch to the original baseline; verifier/build artifacts
+    # created after this boundary must not keep that historical mutation alive.
+    agent_differs_from_baseline = bool(
+        baseline_digest and agent_boundary and agent_boundary != baseline_digest)
+    current_patch_attributed = bool(
+        patch_attributed and agent_differs_from_baseline)
+    evidence["agent_differs_from_baseline"] = agent_differs_from_baseline
+    evidence["patch_attributed"] = current_patch_attributed
+    verified = bool(
+        evidence.get("passed") and boundary_matches and current_patch_attributed)
+    detail = ("configured host check passed against the current Mission patch" if verified else
+              "check passed but the Mission produced no attributed patch"
+              if evidence.get("passed") and boundary_matches else
+              "workspace changed between the agent boundary and host verification"
+              if evidence.get("passed") and not boundary_matches else
+              "configured check failed (exit %s)" % evidence.get("exit_code"))
+    return {"verified": verified, "detail": detail, "evidence": evidence}
+
+
+def _live_code(goal, workspace=None, mission_id=None, host_verifier=None,
+               execution_profile=None, verify_command="", session_id="",
+               baseline_tree_digest="", expected_tree_digest="", slice_turns=None,
+               verify_timeout_seconds=None, max_session_storage_bytes=None,
+               max_model_calls=None, mission_store_path="", mission_run_token=""):
+    import os
+    from . import sessions
+    from .cli import make_harness
+    from . import settings as _s
+    cwd = os.path.realpath(os.path.abspath(workspace or os.getcwd()))
+    roots = [os.path.realpath(os.path.abspath(p)) for p in
+             (os.environ.get("COLLIE_MISSION_CODE_ROOTS") or "").split(os.pathsep) if p]
+    try:
+        approved = any(os.path.commonpath([cwd, root]) == root for root in roots)
+    except ValueError:
+        approved = False
+    if not roots or not approved:
+        return {"answer": "Mission code is disabled for this workspace; add an approved root to "
+                          "COLLIE_MISSION_CODE_ROOTS and explicitly allow the code capability.",
+                "verified": False}
+    if not os.path.isdir(cwd):
+        return {"answer": "approved code workspace does not exist", "verified": False}
+    profile = dict(execution_profile or {})
+    provider = str(profile.get("provider") or _s.get("PROVIDER") or "").strip()
+    model = str(profile.get("model") or _s.get("MODEL") or "").strip() or None
+    if profile:
+        if profile.get("allow_provider_fallback") is not False:
+            return {"answer": "frozen code execution profile permits provider fallback",
+                    "verified": False}
+        subscription = provider in (
+            "anthropic-oauth", "claude-sub", "claude-cli", "cli",
+            "claude-agent-sdk", "claude-sdk",
+            "codex-oauth", "codex-sub", "codex")
+        if profile.get("subscription_only") and not subscription:
+            return {"answer": "frozen subscription code route is invalid", "verified": False}
+        if profile.get("subscription_only") and profile.get("billing_mode") != "subscription":
+            return {"answer": "frozen subscription billing mode is inconsistent",
+                    "verified": False, "needs_human": True}
+        if (profile.get("profile") == "overnight" and
+                provider != "claude-agent-sdk"):
+            return {"answer": (
+                        "overnight code requires the official Claude Agent SDK "
+                        "with Collie's system prompt"),
+                    "verified": False, "needs_human": True}
+    project = "mission-code-" + hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:12]
+    sid = str(session_id or _code_session_id(mission_id, cwd))
+    if (len(sid) > 128 or not sid or
+            not all(ch.isalnum() or ch in "-_." for ch in sid)):
+        return {"answer": "durable code session id is invalid", "verified": False,
+                "needs_human": True}
+    checked = sessions.load_checked(sid)
+    if checked.get("status") == "invalid":
+        return {
+            "answer": "durable code session is corrupt or unreadable; inspect it before retrying",
+            "verified": False, "continue_needed": False, "recovery_required": True,
+            "session_id": sid,
+        }
+    saved = checked.get("session") or {}
+    saved_cwd = str(saved.get("cwd") or "")
+    if saved_cwd and os.path.realpath(os.path.abspath(saved_cwd)) != cwd:
+        return {
+            "answer": "durable code session belongs to a different workspace",
+            "verified": False, "continue_needed": False, "recovery_required": True,
+            "session_id": sid,
+        }
+    recovery = sessions.recovery_state(sid)
+    if recovery and recovery.get("recovery_required"):
+        return {
+            "answer": recovery.get("reason") or "code session requires recovery inspection",
+            "verified": False, "continue_needed": False, "recovery_required": True,
+            "session_id": sid,
+        }
+    history = saved.get("messages") or None
+    from .verification import workspace_snapshot
+    prior_receipts = list(saved.get("run_receipts") or [])
+    for receipt in prior_receipts:
+        if not isinstance(receipt, dict):
+            return {"answer": "durable code receipt is malformed", "verified": False,
+                    "continue_needed": False, "recovery_required": True,
+                    "session_id": sid}
+        receipt_sid = str(receipt.get("session_id") or "")
+        if receipt_sid and receipt_sid != sid:
+            return {"answer": "durable code receipt identity does not match this Mission",
+                    "verified": False, "continue_needed": False,
+                    "recovery_required": True, "session_id": sid}
+        receipt_mid = str(receipt.get("mission_id") or "")
+        if mission_id and receipt_mid and receipt_mid != str(mission_id):
+            return {"answer": "durable code receipt belongs to a different Mission",
+                    "verified": False, "continue_needed": False,
+                    "recovery_required": True, "session_id": sid}
+    baseline_digest = str(baseline_tree_digest or "")
+    for receipt in prior_receipts:
+        if (not baseline_digest and isinstance(receipt, dict) and
+                receipt.get("baseline_tree_digest")):
+            baseline_digest = str(receipt["baseline_tree_digest"])
+            break
+    if not baseline_digest:
+        baseline_digest = str(workspace_snapshot(cwd).get("tree_digest") or "")
+    receipt_baselines = {
+        str(receipt.get("baseline_tree_digest") or "") for receipt in prior_receipts
+        if receipt.get("kind") in (
+            "mission_code_baseline", "mission_code_slice",
+            "mission_code_reconciled") and
+        receipt.get("baseline_tree_digest")}
+    if receipt_baselines and receipt_baselines != {baseline_digest}:
+        return {"answer": "durable code baseline does not match this Mission",
+                "verified": False, "continue_needed": False,
+                "recovery_required": True, "session_id": sid}
+    if not any(isinstance(receipt, dict) and
+               receipt.get("kind") == "mission_code_baseline"
+               for receipt in prior_receipts):
+        # Persist this before the first possible edit.  If the worker dies after
+        # changing files but before its final slice receipt, restart still knows
+        # which bytes belonged to the user and which belong to this Mission.
+        baseline_persisted = sessions.append_run_receipt(sid, {
+            "kind": "mission_code_baseline",
+            "mission_id": str(mission_id or ""),
+            "session_id": sid,
+            "baseline_tree_digest": baseline_digest,
+        }, limit=128)
+        if not baseline_persisted:
+            return {
+                "answer": "could not durably persist the pre-edit code baseline",
+                "verified": False, "continue_needed": False,
+                "recovery_required": True, "session_id": sid,
+                "baseline_tree_digest": baseline_digest,
+            }
+        reloaded = sessions.load_checked(sid)
+        if reloaded.get("status") != "ok":
+            return {
+                "answer": "durable code baseline could not be read back safely",
+                "verified": False, "continue_needed": False,
+                "recovery_required": True, "session_id": sid,
+                "baseline_tree_digest": baseline_digest,
+            }
+        prior_receipts = list(
+            (reloaded.get("session") or {}).get("run_receipts") or [])
+    # Reconstruct the last Collie-owned byte boundary from durable receipts.  A
+    # worker can finish its slice receipt and die before Mission folds the case;
+    # that completed, contiguous receipt is safe to adopt.  Any other change is
+    # external drift and must be inspected instead of silently attributed to us.
+    #
+    # Physical ownership and patch provenance are deliberately separate.  A
+    # host verifier may create cache/build files which must be included in the
+    # next slice's expected byte boundary, but those files must never become
+    # evidence that the coding agent changed the project.  Only new-format
+    # slice receipts with an explicit pre-verifier mutation, or a human-approved
+    # completed reconciliation, establish patch provenance.  Legacy receipts
+    # are physically replayable but provenance-ambiguous and therefore fail
+    # closed for completion.
+    patch_attributed = False
+    provenance_expected = str(baseline_digest or "")
+    for receipt in prior_receipts:
+        if not isinstance(receipt, dict) or receipt.get("kind") not in (
+                "mission_code_slice", "mission_code_reconciled"):
+            continue
+        before = str(receipt.get("pre_tree_digest") or "")
+        after = str(receipt.get("post_tree_digest") or "")
+        if not before or not after or before != provenance_expected:
+            continue
+        if receipt.get("kind") == "mission_code_slice":
+            agent_after = str(receipt.get("agent_post_tree_digest") or "")
+            if (receipt.get("snapshot_complete") is True and
+                    receipt.get("agent_snapshot_complete") is True and
+                    agent_after):
+                # This is state, not an ever-fired event.  In particular, a
+                # later receipt with ``patch_attributed: false`` records that
+                # its agent restored the original baseline.  Replaying older
+                # ``agent_mutated`` events must not resurrect that patch after
+                # a verifier artifact advances the physical receipt chain.
+                patch_attributed = bool(
+                    receipt.get("patch_attributed") is True and
+                    receipt.get("verifier_mutated") is False and
+                    agent_after != baseline_digest)
+            else:
+                # Legacy/partial receipts are physically replayable below but
+                # cannot establish completion-grade patch provenance.
+                patch_attributed = False
+        elif (receipt.get("kind") == "mission_code_reconciled" and
+              receipt.get("resolution") == "completed" and before != after):
+            patch_attributed = True
+        provenance_expected = after
+    expected_digest = str(expected_tree_digest or baseline_digest or "")
+    for receipt in prior_receipts:
+        if not isinstance(receipt, dict) or receipt.get("kind") not in (
+                "mission_code_slice", "mission_code_reconciled"):
+            continue
+        if receipt.get("kind") == "mission_code_reconciled" and (
+                receipt.get("resolution") != "completed" or
+                receipt.get("snapshot_complete") is not True):
+            return {
+                "answer": "durable code reconciliation receipt is malformed",
+                "verified": False, "continue_needed": False,
+                "recovery_required": True, "session_id": sid,
+            }
+        before = str(receipt.get("pre_tree_digest") or "")
+        after = str(receipt.get("post_tree_digest") or "")
+        if before and after and before == expected_digest:
+            expected_digest = after
+    try:
+        session_limit = max(0, int(max_session_storage_bytes or 0))
+    except (TypeError, ValueError):
+        session_limit = 0
+    before_session_bytes = sessions.storage_bytes(sid)
+    if session_limit and before_session_bytes >= session_limit:
+        return {
+            "answer": "durable code session storage budget is exhausted",
+            "verified": False, "continue_needed": False, "needs_human": True,
+            "session_id": sid, "baseline_tree_digest": baseline_digest,
+            "_external_storage_bytes": before_session_bytes,
+        }
+    pre_slice = workspace_snapshot(cwd)
+    if (not pre_slice.get("snapshot_complete") or not expected_digest or
+            str(pre_slice.get("tree_digest") or "") != expected_digest):
+        return {
+            "answer": (
+                "workspace bytes changed outside the last completed Collie code slice; "
+                "inspect and reconcile ownership before continuing"),
+            "verified": False, "continue_needed": False,
+            "recovery_required": True, "needs_human": False,
+            "session_id": sid, "baseline_tree_digest": baseline_digest,
+            "expected_tree_digest": expected_digest,
+            "post_tree_digest": str(pre_slice.get("tree_digest") or ""),
+            "_external_storage_bytes": before_session_bytes,
+        }
+    h = make_harness(cwd, provider=provider, model=model,
+                     project=project, embed="hash", rerank="off", distill="off",
+                     web_search=False, code_search=True, exec_code=False,
+                     subscription_only=bool(profile.get("subscription_only")))
+    request_store = None
+    if mission_store_path and mission_run_token:
+        from .mission import MissionStore
+        request_store = MissionStore(str(mission_store_path))
+
+        def reserve_request(purpose="code_agent"):
+            request_id = "req_" + secrets.token_hex(16)
+            ok = request_store.reserve_model_request(
+                str(mission_id or ""), str(mission_run_token), request_id,
+                provider=getattr(h.provider, "name", ""),
+                model=getattr(h.provider, "model", ""), purpose=purpose)
+            return request_id if ok else None
+
+        h.provider.request_gate = reserve_request
+        h.provider.request_complete = request_store.complete_model_request
+    elif profile.get("profile") == "overnight" and max_model_calls not in (None, ""):
+        return {"answer": "overnight code model-request authority is missing",
+                "verified": False, "needs_human": True}
+    if profile.get("subscription_only"):
+        # Claude Code normally permits an API-key fallback. Overnight code does
+        # not: its frozen billing route is part of Mission authority.
+        h.provider.subscription_only = True
+    # Positive authority list: a capability advertised as reversible cannot load
+    # browser/desktop/MCP hands or a general shell behind Mission's outer gate.
+    _restrict_code_child(h, cwd)
+    # This child intentionally has no shell capability.  Verification is an
+    # exact parent-authorized host command after every slice, so the generic
+    # loop's "use bash to verify" nudge would only waste a model turn.
+    h.self_verify = False
+    if profile.get("profile") == "overnight":
+        # Let Mission's durable wait/backoff own transport retries.  Sleeping and
+        # retrying inside a killable slice obscures the runnable-boundary auth
+        # recheck and can consume several subscription requests before the
+        # campaign call leash is folded.
+        h.max_retries = 0
+        h.critic = False
+    if slice_turns in (None, "", 0, "0"):
+        try:
+            slice_turns = int(os.environ.get(
+                "COLLIE_CODE_SLICE_TURNS", os.environ.get("COLLIE_CODE_TURNS", "24")))
+        except (TypeError, ValueError):
+            slice_turns = 24
+    try:
+        slice_turns = int(slice_turns)
+    except (TypeError, ValueError):
+        slice_turns = 24
+    h.max_turns = max(1, min(50, slice_turns))
+    if max_model_calls not in (None, ""):
+        try:
+            h.max_model_calls = max(0, int(max_model_calls))
+        except (TypeError, ValueError):
+            h.max_model_calls = 0
+        if h.max_model_calls:
+            h.max_turns = min(h.max_turns, h.max_model_calls)
+    h.durable_session_id = sid
+    h.checkpoint_scope = "session:" + sid
+    prompt = str(goal or "")
+    if history:
+        prompt = ("Continue the same coding task from its durable checkpoint. Inspect the "
+                  "current workspace before editing; do not repeat completed work.\n\n"
+                  "Original goal: " + prompt)
+        if prior_receipts:
+            last_check = prior_receipts[-1].get("verification") \
+                if isinstance(prior_receipts[-1], dict) else None
+            last_check = last_check if isinstance(last_check, dict) else {}
+            last_evidence = last_check.get("evidence") \
+                if isinstance(last_check.get("evidence"), dict) else {}
+            feedback = str(last_check.get("detail") or "").strip()
+            output = str(last_evidence.get("output") or "").strip()
+            if feedback or output:
+                prompt += ("\n\nHost verification after the previous slice (ground truth; "
+                           "repair this before finishing):\n" +
+                           (feedback + "\n" if feedback else "") + output[-2500:])
+    try:
+        res = h.run("code:" + str(mission_id or project), prompt, history=history)
+    except Exception:
+        # The durable baseline was written before entering the model/tool loop.
+        # Close local stores before propagating so the process wrapper can turn
+        # this outcome-uncertain boundary into Mission recovery state.
+        try:
+            h.memory.close()
+            h.recorder.close()
+            if request_store is not None:
+                request_store.close()
+        except Exception:
+            pass
+        raise
+    # Freeze the exact agent-owned boundary before transcript persistence or
+    # the host verifier can touch the workspace.  The final post-slice snapshot
+    # below remains the physical continuation boundary; this one alone decides
+    # whether this slice contributed patch provenance.
+    agent_post_slice = workspace_snapshot(cwd)
+    agent_snapshot_complete = bool(
+        pre_slice.get("snapshot_complete") and
+        agent_post_slice.get("snapshot_complete"))
+    agent_mutated = bool(
+        agent_snapshot_complete and
+        pre_slice.get("tree_digest") != agent_post_slice.get("tree_digest"))
+    # ``patch_attributed`` reconstructed above means a prior slice introduced
+    # agent-owned bytes.  It must not remain sticky after a later agent slice
+    # restores the exact original baseline.  This check deliberately uses the
+    # pre-verifier boundary: build/test artifacts created next may change the
+    # physical continuation digest, but can never resurrect a reverted patch.
+    agent_post_digest = str(agent_post_slice.get("tree_digest") or "")
+    patch_attributed = bool(
+        (patch_attributed or agent_mutated) and agent_snapshot_complete and
+        baseline_digest and agent_post_digest != baseline_digest)
+    sessions.save(sid, res.messages, project=project, cwd=cwd, answer=res.answer or "")
+    if host_verifier is None:
+        verification = _default_code_verifier(
+            cwd, res, verify_command, baseline_digest=baseline_digest,
+            timeout_seconds=verify_timeout_seconds or 300,
+            patch_attributed=patch_attributed,
+            agent_post_tree_digest=str(agent_post_slice.get("tree_digest") or ""))
+    else:
+        verification = host_verifier(cwd, res)
+    if isinstance(verification, bool):
+        verification = {"verified": verification}
+    verification = verification if isinstance(verification, dict) else {}
+    verified = bool(verification.get("verified"))
+    error_text = str(getattr(res, "error", "") or "")
+    if not error_text and str(getattr(res, "answer", "") or "").startswith("ERROR("):
+        error_text = str(getattr(res, "answer", "") or "")
+    transient = False
+    if error_text:
+        from .providers import classify_error
+        transient = classify_error(error_text) == "retryable"
+    post_slice = workspace_snapshot(cwd)
+    slice_snapshot_complete = bool(agent_snapshot_complete and
+                                   post_slice.get("snapshot_complete"))
+    verifier_mutated = bool(
+        slice_snapshot_complete and
+        agent_post_slice.get("tree_digest") != post_slice.get("tree_digest"))
+    # A verifier that changes any represented project byte invalidates prior
+    # agent ownership for continuation. Without per-path provenance, retaining
+    # the bool would let a verifier overwrite the agent's source in slice N and
+    # have that replacement laundered as an agent patch in slice N+1. Common
+    # untracked Python cache artifacts are excluded by workspace_snapshot, so
+    # ordinary py_compile/pytest startup does not cause a false taint.
+    patch_attributed = bool(patch_attributed and not verifier_mutated)
+    # Public/receipt mutation attribution is the agent-side delta only.  The
+    # physical post_tree_digest still includes verifier bytes so restart/drift
+    # checks bind the exact workspace that actually exists.
+    slice_mutated = agent_mutated
+    session_recovery = sessions.recovery_state(sid)
+    journal_uncertain = bool(session_recovery and
+                             session_recovery.get("recovery_required"))
+    recovery_required = bool(journal_uncertain or not slice_snapshot_complete)
+    needs_human = bool(error_text and not transient and not verified and
+                       not recovery_required)
+    continue_needed = bool(not verified and not recovery_required and not needs_human and
+                           (getattr(res, "turns_exhausted", False) or transient or
+                            profile.get("profile") == "overnight"))
+    marginal_cost = 0.0 if profile.get("subscription_only") else float(
+        getattr(res, "cost_usd", 0.0) or 0.0)
+    usage = {
+        "input_tokens": int(getattr(res, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(res, "output_tokens", 0) or 0),
+        "cache_tokens": int(getattr(res, "cache_read", 0) or 0) +
+                        int(getattr(res, "cache_creation", 0) or 0),
+        # Mission's cost leash is a charge leash.  Equivalent API value remains
+        # visible separately instead of falsely stopping a flat subscription.
+        "cost_usd": marginal_cost,
+        "equivalent_cost_usd": float(getattr(res, "cost_usd", 0.0) or 0.0),
+    }
+    receipt = {
+        "kind": "mission_code_slice", "mission_id": str(mission_id or ""),
+        "session_id": sid, "baseline_tree_digest": baseline_digest,
+        "pre_tree_digest": str(pre_slice.get("tree_digest") or ""),
+        "agent_post_tree_digest": str(agent_post_slice.get("tree_digest") or ""),
+        "post_tree_digest": str(post_slice.get("tree_digest") or ""),
+        "snapshot_complete": slice_snapshot_complete,
+        "agent_snapshot_complete": agent_snapshot_complete,
+        "agent_mutated": agent_mutated,
+        "verifier_mutated": verifier_mutated,
+        "patch_attributed": patch_attributed,
+        "turns": int(getattr(res, "turns", 0) or 0),
+        "turns_exhausted": bool(getattr(res, "turns_exhausted", False)),
+        "verified": verified, "continue_needed": continue_needed,
+        "verification": verification,
+        "usage": usage,
+    }
+    receipt_persisted = sessions.append_run_receipt(sid, receipt, limit=128)
+    if not receipt_persisted:
+        # The workspace may already contain edits. Without the post-slice WAL
+        # receipt those bytes have uncertain ownership and must be reconciled;
+        # never report verification success or silently start another slice.
+        verified = False
+        continue_needed = False
+        recovery_required = True
+        needs_human = False
+    session_bytes = sessions.storage_bytes(sid)
+    try:
+        h.settle_run_memory(res, verified, verification.get("evidence"),
+                            source="mission_code_verification")
+        h.recorder.finish_run(res)
+    except Exception:
+        pass
+    try:
+        h.memory.close(); h.recorder.close()
+        if request_store is not None:
+            request_store.close()
+    except Exception:
+        pass
+    return {
+        "answer": (
+            "code slice completed but its ownership receipt was not durably persisted"
+            if not receipt_persisted else res.answer or res.error or ""),
+        "verified": verified,
+        "continue_needed": continue_needed, "session_id": sid,
+        "turns_exhausted": bool(getattr(res, "turns_exhausted", False)),
+        "turns": int(getattr(res, "turns", 0) or 0),
+        "model_calls": int(getattr(res, "model_calls", 0) or
+                           getattr(res, "turns", 0) or 0),
+        "_model_calls_reserved": bool(request_store is not None),
+        "_usage": {key: usage[key] for key in
+                   ("input_tokens", "output_tokens", "cache_tokens", "cost_usd")},
+        "equivalent_cost_usd": usage["equivalent_cost_usd"],
+        "baseline_tree_digest": baseline_digest,
+        "expected_tree_digest": expected_digest,
+        "agent_post_tree_digest": str(agent_post_slice.get("tree_digest") or ""),
+        "post_tree_digest": str(post_slice.get("tree_digest") or ""),
+        "verification": verification,
+        "error": error_text[:1000],
+        "transient": transient,
+        "retry_after_seconds": 60 if transient else 0,
+        "recovery_required": recovery_required,
+        "needs_human": needs_human,
+        "slice_mutated": slice_mutated,
+        "verifier_mutated": verifier_mutated,
+        "patch_attributed": patch_attributed,
+        "_external_storage_bytes": session_bytes,
+    }
+
+
+def _real_code(runner=None):
+    def execute(rec):
+        goal = (rec.args or {}).get("goal") or (rec.args or {}).get("task") or ""
+        ws = (rec.args or {}).get("workspace") or (rec.args or {}).get("cwd")
+        case = (rec.args or {}).get("_case") or {}
+        execution_profile = case.get("execution_profile") or {}
+        code_profile = case.get("code_profile") or {}
+        active_runner = runner
+        if active_runner is None:
+            out = _live_code(
+                goal, ws, mission_id=getattr(rec, "job_id", ""),
+                execution_profile=execution_profile,
+                verify_command=code_profile.get("verify_command") or "",
+                session_id=(code_profile.get("session_id") or
+                            case.get("code_session_id") or ""),
+                baseline_tree_digest=(case.get("code_baseline_tree_digest") or ""),
+                expected_tree_digest=(case.get("code_expected_tree_digest") or ""),
+                slice_turns=code_profile.get("slice_turns"),
+                verify_timeout_seconds=code_profile.get("verify_timeout_seconds"),
+                max_session_storage_bytes=code_profile.get(
+                    "max_session_storage_bytes"),
+                max_model_calls=(rec.args or {}).get("_model_call_budget"))
+        else:
+            # Keep the long-standing injected ``runner(goal)`` seam while
+            # allowing Mission-aware runners to opt into durable identity.
+            try:
+                sig = inspect.signature(active_runner)
+                params = sig.parameters
+                accepts_context = (any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()) or
+                    any(name in params for name in (
+                        "workspace", "mission_id", "execution_profile",
+                        "verify_command", "max_wall_seconds", "session_id",
+                        "baseline_tree_digest", "slice_turns",
+                        "expected_tree_digest",
+                        "max_model_calls",
+                        "mission_store_path", "mission_run_token",
+                        "verify_timeout_seconds", "max_session_storage_bytes")))
+            except (TypeError, ValueError):
+                accepts_context = False
+            if accepts_context:
+                context = {
+                    "workspace": ws, "mission_id": getattr(rec, "job_id", ""),
+                    "execution_profile": execution_profile,
+                    "verify_command": code_profile.get("verify_command") or "",
+                    "session_id": (code_profile.get("session_id") or
+                                   case.get("code_session_id") or ""),
+                    "baseline_tree_digest": str(
+                        case.get("code_baseline_tree_digest") or ""),
+                    "expected_tree_digest": str(
+                        case.get("code_expected_tree_digest") or ""),
+                    "slice_turns": code_profile.get("slice_turns"),
+                    "verify_timeout_seconds": code_profile.get(
+                        "verify_timeout_seconds"),
+                    "max_session_storage_bytes": code_profile.get(
+                        "max_session_storage_bytes"),
+                    "max_model_calls": (rec.args or {}).get("_model_call_budget"),
+                    "mission_store_path": str(
+                        getattr(rec, "_mission_store_path", "") or ""),
+                    "mission_run_token": str(
+                        getattr(rec, "_mission_run_token", "") or ""),
+                    # Finish and kill inside the process runner just before the
+                    # outer watchdog only as a last-resort fallback.  The outer
+                    # owner fires first so timeout becomes recovery_required
+                    # instead of an ordinary reversible failure/retry loop.
+                    "max_wall_seconds": max(1.0, float(
+                        ((rec.args or {}).get("_leash") or {}).get(
+                            "max_step_seconds", 600)) + 30.0),
+                }
+                accepts_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values())
+                kwargs = context if accepts_kwargs else {
+                    key: value for key, value in context.items()
+                    if key in sig.parameters}
+                out = active_runner(goal, **kwargs)
+            else:
+                out = active_runner(goal)
+        if isinstance(out, str):
+            out = {"answer": out, "verified": False}
+        pending = bool(out.get("continue_needed"))
+        verification = out.get("verification") if isinstance(
+            out.get("verification"), dict) else {}
+        evidence = verification.get("evidence") if isinstance(
+            verification.get("evidence"), dict) else {}
+        case_update = {
+            "coded": True, "code_verified": bool(out.get("verified")),
+            "code_pending": pending,
+            "code_session_id": str(out.get("session_id") or ""),
+            "code_recovery_required": bool(out.get("recovery_required")),
+        }
+        if out.get("post_tree_digest") and not out.get("recovery_required"):
+            case_update["code_expected_tree_digest"] = str(
+                out.get("post_tree_digest") or "")
+        if verification:
+            # Bounded host evidence is durable Mission state.  The goal verifier
+            # rechecks its workspace digest after restart instead of trusting the
+            # coding model's final answer.
+            case_update["code_verification"] = verification
+            case_update["code_baseline_tree_digest"] = str(
+                out.get("baseline_tree_digest") or
+                evidence.get("baseline_tree_digest") or "")
+        return {
+            "case": case_update,
+            "result": out.get("answer", ""), "verified": bool(out.get("verified")),
+            "continue_needed": pending, "session_id": out.get("session_id", ""),
+            "recovery_required": bool(out.get("recovery_required")),
+            "needs_human": bool(out.get("needs_human")),
+            "transient": bool(out.get("transient")),
+            "retry_after_seconds": int(out.get("retry_after_seconds", 0) or 0),
+            "turns_exhausted": bool(out.get("turns_exhausted")),
+            "turns": int(out.get("turns", 0) or 0),
+            "model_calls": int(out.get("model_calls", 0) or 0),
+            "_model_calls_reserved": bool(out.get("_model_calls_reserved")),
+            "_usage": dict(out.get("_usage") or {}),
+            "equivalent_cost_usd": float(out.get("equivalent_cost_usd", 0.0) or 0.0),
+            "verification": out.get("verification"),
+            "error": out.get("error", ""),
+            "_external_storage_bytes": int(
+                out.get("_external_storage_bytes", 0) or 0),
+        }
+    return execute
+
+
+def _code_resource(rec):
+    """Serialize edits to the same canonical workspace across Missions/processes."""
+    ws = (rec.args or {}).get("workspace") or (rec.args or {}).get("cwd") or os.getcwd()
+    root = os.path.realpath(os.path.abspath(str(ws)))
+    return "code-workspace:" + hashlib.sha256(root.encode("utf-8")).hexdigest()
+
+
+def _code_verify(rec, result):
+    """Done-check = collie's OWN executed verification (a repro that fails on the
+    broken code, an edit that flips it, a re-run that passes). Verified only when the
+    coding loop reported that gate green; an edit without it is INCONCLUSIVE, not done."""
+    r = result or {}
+    if r.get("recovery_required"):
+        return Verdict(FAILED, "code worker stopped at an outcome-uncertain edit boundary")
+    if r.get("verified"):
+        return Verdict(VERIFIED, "Mission patch passed the configured fresh host check")
+    if r.get("continue_needed") and r.get("session_id"):
+        return Verdict(VERIFIED, "bounded code slice durably checkpointed; continuing automatically")
+    if r.get("result"):
+        return Verdict(INCONCLUSIVE, "code edited but not executed-verified — a human should check")
+    return Verdict(FAILED, "coding task produced no result")
+
+
+def _stub_code(rec):
+    goal = (rec.args or {}).get("goal") or ""
+    return {"case": {"coded": True, "code_verified": True},
+            "result": "(stub) fixed: " + goal[:50], "verified": True}
+
+
+def _semantic_web_submit(args):
+    """Canonical executor inputs; aliases/verification hints cannot split a key."""
+    a = args or {}
+    return {"url": a.get("url") or "", "fields": a.get("fields") or {},
+            "submit": a.get("submit") or a.get("submit_selector") or ""}
+
+
+def _semantic_web_send(args):
+    a = args or {}
+    # `to` is display/case metadata only; the executor binds the actual thread by
+    # URL + selectors. Letting `to` split the key could resend on that same thread.
+    return {"url": a.get("url") or "", "text": a.get("text") or "",
+            "selector": a.get("selector") or a.get("message_selector") or "",
+            "send": a.get("send") or a.get("send_selector") or ""}
+
+
+def _semantic_browse_submit(args):
+    a = args or {}
+    return {"button": a.get("button") or a.get("text") or "Publish"}
+
+
+def _semantic_account_submit(args):
+    a = args or {}
+    return {
+        "account_id": a.get("account_id") or "",
+        "step": a.get("step") or "registration",
+        "button": a.get("button") or a.get("text") or "Continue",
+        "success_text": a.get("success_text") or "",
+        "success_url_contains": a.get("success_url_contains") or "",
+        "active_text": a.get("active_text") or "",
+        "active_path": a.get("active_path") or "",
+    }
+
+
+def _account_resource(rec):
+    account_id = str((getattr(rec, "args", None) or {}).get("account_id") or "").strip()
+    return ("account:" + account_id) if account_id else "account:invalid"
+
+
+# ══════════════════════════ registration ═════════════════════════════════════
+def register_primitives(stub: bool = True, actuator=None, provider=None,
+                        research_runner=None, browse_runner=None, code_runner=None,
+                        otp_reader=None, identity_reader=None, identity_loader=None,
+                        account_loader=None, communications_loader=None,
+                        account_registry_factory=None):
+    """Register the neutral primitive set. `stub=True` wires the canned bodies
+    (container tests / safe default). `stub=False` wires the REAL bodies; deps are
+    injectable (actuator/provider/research_runner/browse_runner/code_runner) for
+    tests, and fall back to live ones when omitted."""
+    if stub:
+        research_exec, research_verify = _stub_research, _read_verify
+        compose_exec, compose_verify = _stub_compose, _read_verify
+        observe_exec, observe_verify = _stub_observe, _read_verify
+        submit_exec, submit_verify = _stub_web_submit, _stub_submit_verify
+        send_exec, send_verify = _stub_web_send, _stub_send_verify
+        browse_exec, browse_verify = _stub_browse, _browse_verify
+        bsubmit_exec, bsubmit_verify = _stub_browse_submit, _browse_submit_verify
+        code_exec, code_verify = _stub_code, _code_verify
+        identity_status_exec = _stub_identity_status
+        account_status_exec = _stub_account_status
+        account_prepare_exec = _stub_account_prepare
+        account_fill_exec = _stub_account_fill
+        account_submit_exec = _stub_account_submit
+        account_complete_exec = _stub_account_complete
+        account_abort_exec = _stub_account_abort
+        communications_status_exec = _stub_communications_status
+        identity_exec, identity_verify = _stub_identity_fill, _identity_fill_verify
+        verification_exec, verification_verify = _stub_verification_fill, _verification_fill_verify
+        browser_resource = code_resource = bsubmit_snapshot = bsubmit_unchanged = None
+        account_submit_snapshot = account_submit_unchanged = None
+    else:
+        research_exec, research_verify = _real_research(research_runner), _real_research_verify
+        compose_exec, compose_verify = _real_compose(provider), _compose_verify
+        observe_exec, observe_verify = _real_observe(actuator), _read_verify
+        submit_exec, submit_verify = _real_web_submit(actuator), _real_submit_verify
+        send_exec, send_verify = _real_web_send(actuator), _real_send_verify
+        browse_exec, browse_verify = _real_browse(browse_runner), _browse_verify
+        bsubmit_exec, bsubmit_verify = _real_browse_submit(actuator), _browse_submit_verify
+        code_exec, code_verify = _real_code(code_runner), _code_verify
+        identity_status_exec = _real_identity_status(identity_loader)
+        account_status_exec = _real_account_status(account_loader)
+        account_prepare_exec = _real_account_prepare(
+            account_registry_factory, identity_loader)
+        account_fill_exec = _real_account_fill(actuator, account_registry_factory)
+        account_submit_exec = _real_account_submit(actuator, account_registry_factory)
+        account_complete_exec = _real_account_complete(actuator, account_registry_factory)
+        account_abort_exec = _real_account_abort(account_registry_factory)
+        communications_status_exec = _real_communications_status(communications_loader)
+        identity_exec = _real_identity_fill(actuator, identity_reader)
+        identity_verify = _identity_fill_verify
+        verification_exec = _real_verification_fill(actuator, otp_reader)
+        verification_verify = _verification_fill_verify
+        browser_resource = "browser-profile"
+        bsubmit_snapshot = _browse_target_snapshot(actuator)
+        bsubmit_unchanged = _browse_target_unchanged(actuator)
+        account_submit_snapshot = _account_submit_snapshot(
+            actuator, account_registry_factory)
+        account_submit_unchanged = _account_submit_unchanged(
+            actuator, account_registry_factory)
+        code_resource = _code_resource
+
+    register(Capability(
+        name="research", execute=research_exec, verify=research_verify, reversible=True,
+        risk="read", description="Gather facts from the web toward a question.",
+        args_hint='{"query"}'))
+    register(Capability(
+        name="compose", execute=compose_exec, verify=compose_verify, reversible=True,
+        risk="read", description=("Create final ready-to-use copy. Put a generation request in "
+                                  "instruction; use text only for already-final literal copy."),
+        args_hint='{"facts","instruction","text (final literal only)"}'))
+    register(Capability(
+        name="observe", execute=observe_exec, verify=observe_verify, reversible=True,
+        risk="read", resource=browser_resource,
+        description="Re-observe the world (logged-out fetch for evidence, "
+        "or authed browser read to poll an inbox).",
+        args_hint='{"url","expect","authed"}'))
+    register(Capability(
+        name="identity.status", execute=identity_status_exec, verify=_read_verify,
+        reversible=True, risk="read",
+        description=("Read Collie's own public work identity: its stable work mailbox, assigned "
+                     "phone and operational status. These belong to Collie and may be used by the "
+                     "model; verification codes and credentials are never included."),
+        args_hint='{}'))
+    register(Capability(
+        name="identity.fill", execute=identity_exec, verify=identity_verify,
+        reversible=True, risk="read", resource=browser_resource,
+        description=("Fill one visible signup field from Collie's public work identity. The model "
+                     "already knows the full mailbox and assigned line; the executor reads the "
+                     "authoritative current value and keeps it out of durable receipts."),
+        args_hint='{"field":"email|phone|display_name|username","label":"Email"}'))
+    register(Capability(
+        name="account.status", execute=account_status_exec, verify=_read_verify,
+        reversible=True, risk="read",
+        description=("Read this Collie's account inventory and native-vault availability. Returns "
+                     "service, username, lifecycle and factor classes only—never passwords, OTPs, "
+                     "recovery material, OAuth tokens, or vault references."),
+        args_hint='{}'))
+    register(Capability(
+        name="account.prepare", execute=account_prepare_exec,
+        verify=_account_prepare_verify, reversible=True, risk="write_local",
+        description=("Prepare one idempotent service-account record for this Collie and generate "
+                     "its password inside the native OS vault. No password, TOTP seed, recovery "
+                     "code, or vault reference is returned to the model."),
+        args_hint=('{' + '"origin":"https://service.example",'
+                   '"username":"optional public Collie mailbox",'
+                   '"tenant":"optional","scopes":[],"factor_classes":[]' + '}')))
+    register(Capability(
+        name="account.fill", execute=account_fill_exec,
+        verify=_account_fill_verify, reversible=True, risk="read",
+        resource=_account_resource,
+        description=("Fill one password or already-enrolled TOTP directly from the native vault "
+                     "into one exact visible field on that account's registered origin. Secret "
+                     "material never enters action args, Mission state, logs, or receipts."),
+        args_hint='{"account_id":"acct_...","factor":"password|totp","label":"Password"}'))
+    register(Capability(
+        name="account.submit", execute=account_submit_exec,
+        verify=_account_submit_verify, reversible=False, risk="publish",
+        resource=_account_resource, snapshot=account_submit_snapshot,
+        unchanged=account_submit_unchanged,
+        description=("Submit one exact registration or verification step for a prepared Collie "
+                     "account. The approval/action snapshot binds account id, canonical public "
+                     "identity, legal ownership, origin, form and exact live button. A successful "
+                     "step enters challenge_wait; it never declares the account active."),
+        args_hint=('{' + '"account_id":"acct_...","step":"registration|verification",'
+                   '"button":"Create account","success_text":"Check your email",'
+                   '"active_text":"Your workspace is ready",'
+                   '"active_path":"/dashboard"' + '}'),
+        semantic_args=_semantic_account_submit))
+    register(Capability(
+        name="account.complete", execute=account_complete_exec,
+        verify=_account_complete_verify, reversible=True, risk="write_local",
+        resource=_account_resource,
+        description=("Mark a submitted Collie account active only after a fresh same-origin "
+                     "browser read shows the exact text and URL path bound before account.submit. "
+                     "This changes local inventory only and returns a value-free evidence hash."),
+        args_hint='{"account_id":"acct_..."}'))
+    register(Capability(
+        name="account.abort", execute=account_abort_exec,
+        verify=_account_abort_verify, reversible=True, risk="write_local",
+        resource=_account_resource,
+        description=("Remove a local-only account preparation and its vault credentials. This "
+                     "fails closed after account.submit begins, because a remote account may then "
+                     "exist and requires reconciliation rather than blind deletion."),
+        args_hint='{"account_id":"acct_..."}'))
+    register(Capability(
+        name="communications.status", execute=communications_status_exec, verify=_read_verify,
+        reversible=True, risk="read",
+        description=("Read truthful calling, SMS, verification-code and voice-synthesis setup for "
+                     "Collie's assigned line, including whether dispatch is actually configured."),
+        args_hint='{}'))
+    register(Capability(
+        name="verification.fill", execute=verification_exec, verify=verification_verify,
+        reversible=True, risk="read", resource=browser_resource,
+        description=("Let Collie receive and use one fresh service-matching code from its connected "
+                     "mailbox or assigned line. The runtime keeps the OTP transient: it is filled "
+                     "once and never persisted in Memory, Mission state, event logs, or receipts."),
+        args_hint='{"service":"Product Hunt","field":"Verification code","max_age_seconds":600}'))
+    register(Capability(
+        name="web.submit", execute=submit_exec, verify=submit_verify, reversible=False,
+        risk="publish", resource=browser_resource,
+        description="Fill and submit a non-commerce form (for example, publish a listing).",
+        args_hint='{"url","fields","submit","expect_title"}',
+        semantic_args=_semantic_web_submit))
+    register(Capability(
+        name="web.send", execute=send_exec, verify=send_verify, reversible=False,
+        risk="send", resource=browser_resource,
+        description="Send a message (reply / negotiate / email).",
+        args_hint='{"url","selector","text","send","success_text"}',
+        semantic_args=_semantic_web_send))
+    register(Capability(
+        name="browse", execute=browse_exec, verify=browse_verify, reversible=True, risk="read",
+        resource=browser_resource,
+        description="Do a task on a website by driving the real browser adaptively (fill a form, "
+        "navigate, act) — handles dynamic/obfuscated sites like Facebook Marketplace. Fills up to the "
+        "final submit then STOPS (reversible). The browser child cannot see the Mission case: embed "
+        "every complete exact field value in goal AND expect; never reference a prior/case draft. "
+        "Pass `expect` using exact visible field labels. For a "
+        "rich-text editor use content/body/post_text and provide its entire final value; platform/site is checked against the live page "
+        "origin. For inspection/navigation with no form changes pass read_only=true (an explicit "
+        "inspect + do-not-change/submit goal is also recognized fail-closed). The outcome is verified "
+        "by an INDEPENDENT re-read, not the agent's say-so.",
+        args_hint='{"goal": "fill Make exactly Toyota, Model exactly Corolla, Year exactly 2015, Price exactly 9500", '
+                  '"expect": {"Make":"Toyota","Model":"Corolla","Year":"2015","Price":"9500"}, '
+                  '"read_only": false}'))
+    register(Capability(
+        name="browse.submit", execute=bsubmit_exec, verify=bsubmit_verify, reversible=False,
+        risk="publish", snapshot=bsubmit_snapshot, unchanged=bsubmit_unchanged,
+        resource=browser_resource,
+        description="Click one exact snapshotted final CONSEQUENTIAL button (Publish / Post / "
+        "Create account / Authorize app) after `browse` has prepared the page. Gated and "
+        "independently verified; commerce is refused and uses a dedicated pay capability.",
+        args_hint='{"button": "Authorize app", "success_url_contains": "producthunt.com"}',
+        semantic_args=_semantic_browse_submit))
+    register(Capability(
+        name="code", execute=code_exec, verify=code_verify, reversible=True, risk="code",
+        resource=code_resource,
+        description="Read / write / refactor code inside one explicitly approved workspace using "
+        "a filesystem-confined child. Mission grants no shell; unverified edits hand off for review.",
+        args_hint='{"goal": "fix the null-pointer in parser.py", "workspace": "/path/to/repo"}'))
+    return [get_capability(name) for name in
+            ("research", "compose", "observe", "identity.status", "identity.fill",
+             "account.status", "account.prepare", "account.fill", "account.submit",
+             "account.complete", "account.abort",
+             "communications.status", "verification.fill", "web.submit", "web.send",
+             "browse", "browse.submit", "code")]

@@ -1,0 +1,2907 @@
+"""Slack Socket Mode listener — @ a collie in a channel and it goes to work.
+
+Why Socket Mode and not a webhook. Event Subscriptions need a publicly reachable
+HTTPS URL, and the machines this runs on are laptops: behind NAT, asleep half the
+day, on an address that changes with the café. That means a tunnel or a relay
+Worker, which is two more things that can be down while looking fine. Socket Mode
+inverts it — *we* dial out to Slack over a WebSocket and events arrive on that
+connection. Nothing to expose, nothing to forward, and a laptop that changes
+networks just reconnects.
+
+Zero third-party dependencies, like the rest of the core (`dependencies = []` in
+pyproject): the WebSocket half is `harness/wsclient.py`, already written for the
+remote relay, and the Web API half is four `urllib` POSTs.
+
+The identity question, and why the dogs have names. "collie-mac" and "collie-win"
+stop working the moment two people both have a Mac, and they read like serial
+numbers. A collie is a working dog and the pack is already in this codebase
+(`collie pack`), so each instance is a dog with a name it keeps: `@Rowan` is the
+one on a particular machine no matter what that machine is called, and a person
+can hold that in their head. The name is chosen once, stored, and announced along
+with where it lives and — this matters more than the name — **what it is allowed
+to do**, so its autonomy is never something you find out afterwards.
+"""
+from __future__ import annotations
+
+import atexit
+import base64
+import contextlib
+import hashlib
+import json
+import os
+import queue
+import re
+import socket as _socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from . import wsclient
+from .slackguard import INTERRUPTED_EXIT as GUARD_INTERRUPTED_EXIT
+
+SLACK_API = "https://slack.com/api/"
+IDENTITY = os.path.expanduser("~/.collie/identity.json")
+QUEUE_DIR = os.path.expanduser("~/.collie/")
+STORE = os.environ.get("COLLIE_SLACK_STORE") or os.path.expanduser("~/.collie/slack.json")
+# This dog's app id and its two tokens. The override keeps isolated/test runtimes from inheriting
+# a real kennel; ordinary installs keep the exact historical path.
+
+# Herding names, because a collie answers to one. Kept short and sayable — this
+# is a name a human types twenty times a day, so nothing that needs spelling out.
+KENNEL = [
+    "Rowan", "Meg", "Bracken", "Nell", "Fly", "Tess", "Moss", "Gwen",
+    "Cap", "Jess", "Pip", "Skye", "Roy", "Bess", "Glen", "Juno",
+]
+
+# Autonomy is a setting, not a policy this file gets to invent. It is stated in
+# the greeting and in `who`, because the only unacceptable version of this is a
+# boundary the owner discovers by watching it get crossed.
+AUTONOMY = {
+    "propose": "reads and reports — writes nothing",
+    "branch": "works on a branch and pushes there; main is yours",
+    "main": "works and pushes to main",
+}
+
+# What each autonomy BOUNDS, as opposed to what it announces. Until this existed the setting was
+# a sentence in the greeting and nothing else: `ident["autonomy"]` appeared once, in the hello
+# message, while the run was spawned with no --mode at all and took the gate's default. A dog
+# introduced to a channel as "propose — writes nothing" could write anything, and the one promise
+# the greeting makes that matters was the one nothing kept.
+#
+# The gate has a single axis — may this run change things — so propose maps to plan (read-only)
+# and the other two to project. branch-vs-main is a git DESTINATION, which no gate mode can
+# express; that half travels in the identity text as an instruction to the model, and is called
+# an instruction below rather than dressed up as a wall.
+AUTONOMY_MODE = {"propose": "plan", "branch": "project", "main": "project"}
+
+# The Slack message body must not appear in process listings, WMI/EDR telemetry or crash command
+# lines. slackexec supports a narrow ``python -c`` path; this constant reads an owner-only one-shot
+# file, removes it before model execution, then invokes the real CLI in-process.
+_SLACK_TASK_BOOTSTRAP = (
+    "import os,sys\n"
+    "from harness import cli\n"
+    "p=sys.argv[1]\n"
+    "try:\n"
+    "    with open(p,encoding='utf-8') as f: task=f.read(1048577)\n"
+    "finally:\n"
+    "    try: os.unlink(p)\n"
+    "    except OSError: pass\n"
+    "if len(task)>1048576: raise SystemExit('Slack task exceeds 1 MiB')\n"
+    "raise SystemExit(cli.main(['run',task]+sys.argv[2:]))\n"
+)
+
+
+def _private_task_file(text: str, queue_path: str) -> str:
+    """Durably stage one Slack prompt without exposing its contents in argv."""
+    directory = os.path.dirname(os.path.abspath(queue_path))
+    os.makedirs(directory, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    fd, path = tempfile.mkstemp(prefix=".slack-task-", suffix=".txt", dir=directory, text=True)
+    try:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(text))
+            f.flush()
+            os.fsync(f.fileno())
+        return path
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+THREADS = os.path.expanduser("~/.collie/threads.json")   # slack thread -> the run it continues
+_THREAD_CAP = 200
+_THREAD_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def _locked_thread_store():
+    """Serialize the shared pack thread map across dogs and processes."""
+    directory = os.path.dirname(os.path.abspath(THREADS))
+    os.makedirs(directory, exist_ok=True)
+    lock_path = THREADS + ".lock"
+    with _THREAD_LOCK:
+        fh = open(lock_path, "a+b")
+        acquired = False
+        try:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if os.name == "nt":
+                import msvcrt
+                if os.path.getsize(lock_path) == 0:
+                    fh.write(b"\0"); fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                try:
+                    fh.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fh.close()
+
+
+def thread_session(channel: str, thread: str, sid: str = "", dog: str = "") -> str:
+    """The collie session a Slack thread continues. Pass `sid` to remember one; returns it either way.
+
+    Keyed by DOG as well as by thread. One machine can run several — that is what the kennel is for,
+    and they work in different repositories — and two of them in one thread share this file. Without
+    the name in the key the second one to be @-ed reads the first one's session id and resumes it:
+    someone else's conversation, in someone else's repository, reported as its own memory of what
+    was just said. A session id belongs to the dog that made it.
+
+    A thread IS the conversation, and every ask in one used to start a run that remembered nothing:
+    a follow-up met a dog with no idea what had just been said, and a peer asked to explain "#9"
+    went looking through its own repository for a number that only existed in someone else's queue.
+    Reading a whole channel is not on offer — a dog sees only its own mentions — but the thread it
+    was mentioned in is exactly the slice that belongs to it.
+
+    Bounded and pruned oldest-first: a dog that runs for weeks should not carry every conversation
+    it has ever had, and losing the oldest costs a resume, not an answer.
+    """
+    key = "%s/%s/%s" % (dog or "-", channel, thread)
+    try:
+        with _locked_thread_store():
+            try:
+                with open(THREADS, encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except FileNotFoundError:
+                data = {}
+            except (OSError, ValueError):
+                return "" if not sid else sid       # preserve corrupt evidence; never overwrite it
+            if not sid:
+                return (data.get(key) or {}).get("session", "")
+            data[key] = {"session": sid, "at": time.time()}
+            if len(data) > _THREAD_CAP:
+                for k in sorted(data, key=lambda k: data[k].get("at", 0))[:len(data) - _THREAD_CAP]:
+                    data.pop(k, None)
+            directory = os.path.dirname(os.path.abspath(THREADS))
+            fd, tmp = tempfile.mkstemp(prefix=".threads-", suffix=".tmp", dir=directory, text=True)
+            try:
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, THREADS)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+    except Exception:
+        pass                        # a thread that cannot be remembered still gets answered
+    return sid
+
+
+def identity_text(ident: dict, peers: str = "") -> str:
+    """Who the dog is, and who else is in the room, for the system prompt of the run it spawns.
+
+    A pack whose whole premise is that members have names a person can hold in their head, and
+    the member did not know its own: the name reached the Slack tag and stopped there.
+
+    The name is stated as a NAME and the breed separately, because the first version said "You are
+    Cornetto, a collie" and the dog, asked in Chinese to greet the others, introduced itself as
+    "collie" — it read the apposition as the answer to "what are you called". Both facts are still
+    here; only the sentence that let them be confused is gone.
+    """
+    a = ident.get("autonomy", "propose")
+    lines = [
+        "Your name is %s. Introduce yourself by that name — 'collie' is what you are (a coding "
+        "agent), not what you are called." % ident.get("name", "collie"),
+        "You work in a repository on %s (%s)." % (ident.get("machine", "this machine"),
+                                                  ident.get("os", "")),
+        "You are reached by @mention in a Slack channel, so answer briefly and say what you did.",
+        "Your autonomy is '%s': %s." % (a, AUTONOMY.get(a, "?")),
+    ]
+    if a == "branch":
+        lines.append("Do not push to main. Put the work on a branch and push that.")
+    if peers:
+        lines.append(peers)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+
+def _hostname() -> str:
+    try:
+        return _socket.gethostname().split(".")[0]
+    except Exception:
+        return "unknown"
+
+
+def machine_label() -> str:
+    """The machine, as a person would say it: "MacBook-Pro", not a serial.
+
+    Derived at run time and never stored with the name, because the point of the
+    name is that it survives moving to another machine — and the moment it does,
+    a stored machine label would be a lie that nobody in the channel can see.
+    """
+    h = _hostname()
+    # "Sinings-MacBook-Pro" → "MacBook-Pro": the owner's name is already obvious
+    # from whose channel it is, and dropping it keeps the line short enough to
+    # sit in front of every message.
+    h = re.sub(r"^[A-Za-z]+s?[-_]", "", h)
+    return (h or "unknown")[:24]
+
+
+def os_label() -> str:
+    """"macOS" / "Windows" / the platform tag — the OS as a person says it, in one place now that
+    the web surface introduces itself with the same three facts the channel greeting uses."""
+    return {"darwin": "macOS", "win32": "Windows"}.get(sys.platform, sys.platform)
+
+
+def fingerprint() -> str:
+    """Four hex characters that stay put across renames.
+
+    Only needed when two machines would otherwise read the same — two identical
+    MacBook Pros in one channel is not a hypothetical. Kept out of the everyday
+    line and shown in `who`, because an id in front of every message is noise
+    until the day it is the only thing that disambiguates.
+    """
+    raw = ""
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.run(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+            raw = m.group(1) if m else ""
+        elif sys.platform == "win32":
+            from . import plat as _plat
+            out = subprocess.run(["reg", "query", r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                                  "/v", "MachineGuid"], capture_output=True, text=True, timeout=5,
+                                 **_plat.no_window_kwargs()).stdout
+            m = re.search(r"MachineGuid\s+REG_SZ\s+(\S+)", out)
+            raw = m.group(1) if m else ""
+        else:
+            with open("/etc/machine-id", encoding="utf-8") as f:
+                raw = f.read().strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        raw = _hostname() + str(os.getuid() if hasattr(os, "getuid") else "")
+    import hashlib
+    return hashlib.sha256(raw.encode()).hexdigest()[:4]
+
+
+# ---------------------------------------------------------------------------
+# The kennel — provisioning a pack, one app per dog
+# ---------------------------------------------------------------------------
+#
+# Slack's identity model is one app = one bot user = one @handle. There is no
+# arrangement of a single app that gives `@rowan` and `@juno` their own
+# autocomplete, their own mentions, and their own avatar — so a pack whose
+# members can be addressed separately needs an app EACH. What makes that
+# affordable is that an app can be created from a manifest over the API: the
+# per-dog cost becomes one command instead of a tour through six settings pages.
+#
+# Bot-only, on purpose, and not as a simplification. The moment an app carries
+# user scopes Slack switches on token rotation, and a rotating app cannot be
+# installed from the button — it must go through an OAuth redirect, and Slack
+# then refuses bot scopes on a loopback one ("Bot scopes are not allowed when
+# redirecting to a non-web URI"). Three rules that close on each other, verified
+# against the live endpoints. A bot-only app is the only shape that installs
+# without the user owning a public https endpoint. The MCP side keeps its own
+# app and its own user token; the two never share a credential.
+
+def app_manifest(name: str) -> dict:
+    """The whole app for one dog: it hears an @, it answers, nothing else."""
+    # Keep the capital. Slack lowercases the @handle ITSELF — the bot user came back from
+    # auth.test as `cornetto` whether or not we sent it that way — so pre-lowercasing here bought
+    # nothing and spent the one place the name is shown with its capital. display_name is the
+    # DISPLAYED name, not the handle; verified against the live endpoint (apps.manifest.update
+    # accepted "Cornetto", stored "Cornetto", permissions_updated=false). The character filter
+    # stays: a name like "Odd Name!" still has to arrive as something Slack will accept.
+    handle = re.sub(r"[^A-Za-z0-9_.-]+", "", name) or "collie"
+    return {
+        "display_information": {
+            "name": name,
+            "description": "A collie you can @ in a channel — it takes the ask and goes to work",
+            "background_color": "#2c2d30",
+        },
+        "features": {
+            "bot_user": {"display_name": handle, "always_online": False},
+            # Without a messages tab the bot has no App Home, and a DM to it goes nowhere.
+            "app_home": {"messages_tab_enabled": True, "messages_tab_read_only_enabled": False},
+        },
+        # channels:join lets the dog walk into the public channels it was told to work in instead of
+        # standing outside until somebody remembers to `/invite` it. The permission it grants is the
+        # one the owner exercises anyway by typing that command — and it cannot reach a private
+        # channel, where an invitation is still the only way in.
+        #
+        # channels:read + users:read are the pack's eyes, and the rule they follow is: a dog sees
+        # what a PERSON IN THAT CHANNEL sees, and nothing else. A member can open the member list
+        # and can look a name up in the directory; without these two a dog could be @-ed by another
+        # dog and have no way to answer it, because addressing anyone in Slack means knowing a
+        # <@U…> id and neither the id nor the name was reachable. Note what is NOT here:
+        # users:read.email is a SEPARATE scope and is not requested, so what reaches the model is
+        # the display name and whether the member is a bot — the member list, not the personnel file.
+        #
+        # reactions:write is status. Progress used to be MESSAGES — `queued #3`, then `on it — #3`,
+        # then that line edited to `#3 done` — so a channel filled with a state machine narrating
+        # itself, and a task number written for one dog's local queue leaked into a pack where it
+        # means nothing (a peer went looking through its own repository for a "#9" that only ever
+        # existed here). A reaction sits on the message that ASKED, which is where anyone looking
+        # for the state of their own request already is.
+        "oauth_config": {"scopes": {"bot": ["app_mentions:read", "chat:write", "channels:join",
+                                            "channels:read", "users:read", "reactions:write"]}},
+        "settings": {
+            # Socket Mode means this dog dials OUT: no public address, no tunnel, and a laptop
+            # that changes network just reconnects. It also makes Slack mint the app-level
+            # token for us, which is one fewer thing to go and fetch by hand.
+            "socket_mode_enabled": True,
+            "event_subscriptions": {"bot_events": ["app_mention"]},
+            "interactivity": {"is_enabled": False},
+            "org_deploy_enabled": False,
+        },
+    }
+
+
+def load_kennel() -> dict:
+    """Every dog this machine has papers for: name -> {app_id, bot_token, app_token, …}.
+
+    Keyed by NAME rather than by machine: the point of the name is that it is the identity, and
+    one machine can perfectly well run several dogs on different repositories.
+    """
+    try:
+        with open(STORE, encoding="utf-8") as f:
+            d = json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+    return d.get("dogs") or {}
+
+
+def save_kennel(dogs: dict) -> None:
+    directory = os.path.dirname(os.path.abspath(STORE))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".slack-kennel-", suffix=".tmp", dir=directory, text=True)
+    try:
+        try:
+            from . import plat
+            plat.chmod_private(tmp)        # it holds two bearer tokens
+        except Exception:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"dogs": dogs}, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STORE)
+        try:
+            os.chmod(STORE, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _start_presence(base_url: str, kept: dict, pack: str, dog: str,
+                    slack_ready: threading.Event, worker):
+    """Start the optional lease client without making Slack depend on the relay.
+
+    `dog` is Slack's bot-user id, not the display name.  Names are for people and may contain
+    Unicode or change during an offline migration; the Slack id is the stable routing identity the
+    operator uses at enrollment.  A partial/invalid presence configuration is visible, but never
+    stops the listener that presence is meant to describe.
+    """
+    base_url = (base_url or kept.get("presence_url", "")).strip().rstrip("/")
+    token = os.environ.get("COLLIE_PRESENCE_TOKEN", "") or kept.get("presence_token", "")
+    values = {"Worker URL": base_url, "credential": token, "workspace id": pack, "bot user id": dog}
+    # Presence is opt-in. Slack ids alone are ordinary kennel metadata, not a half-configured relay.
+    if not base_url and not token:
+        return None
+    missing = [label for label, value in values.items() if not value]
+    if missing:
+        print("[slack] presence disabled: missing %s" % ", ".join(missing), file=sys.stderr)
+        return None
+
+    try:
+        from .presence import PresenceClient
+        client = PresenceClient(
+            base_url, pack, dog, token,
+            # A live process is not enough.  If either the Slack Socket Mode connection or the
+            # task worker dies, keep renewing only a degraded lease so nobody sends work here.
+            health_fn=lambda: slack_ready.is_set() and worker.is_alive(),
+            logf=lambda message: print("[slack] %s" % message, file=sys.stderr),
+        )
+        client.start()
+    except Exception as exc:
+        detail = str(exc).replace(token, "[redacted]") if token else str(exc)
+        print("[slack] presence disabled: %s" % detail, file=sys.stderr)
+        return None
+    atexit.register(client.stop)
+    return client
+
+
+ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui", "collie-icon-512.png")
+
+
+def set_icon(config_token: str, app_id: str, path: str = "") -> str:
+    """Give the app a face while we are already holding the credential that can. "" on success.
+
+    `apps.icon.set` is in no method list — the manifest has no icon field, and Slack's own CLI
+    uploads one on deploy, so something had to exist. It takes `app_id` and a `file` part, and a
+    square PNG of at least 512px (128 comes back `invalid_icon_size`).
+
+    Undocumented means it may change without warning, so this reports and never raises: an app
+    wearing Slack's grey default is a working app, and a setup that got everything else right
+    should not end in a traceback over a picture.
+    """
+    path = path or ICON
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        return str(e)
+    boundary = "----collie%s" % base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+    body = b"".join([
+        ("--%s\r\nContent-Disposition: form-data; name=\"app_id\"\r\n\r\n%s\r\n" % (boundary, app_id)).encode(),
+        ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"icon.png\"\r\n"
+         "Content-Type: image/png\r\n\r\n" % boundary).encode(),
+        blob, b"\r\n", ("--%s--\r\n" % boundary).encode()])
+    req = urllib.request.Request(
+        SLACK_API + "apps.icon.set", data=body,
+        headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
+                 "Authorization": "Bearer " + config_token})
+    try:
+        r = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+    except Exception as e:
+        return str(e)
+    return "" if r.get("ok") else str(r.get("error"))
+
+
+def create_app(config_token: str, manifest: dict) -> dict:
+    """apps.manifest.create — the whole app in one call. Returns Slack's payload."""
+    r = api("apps.manifest.create", config_token, manifest=json.dumps(manifest))
+    if not r.get("ok"):
+        detail = r.get("errors") or r.get("error")
+        raise RuntimeError("apps.manifest.create failed: %s" % json.dumps(detail))
+    return r
+
+
+def export_app(config_token: str, app_id: str) -> dict:
+    """apps.manifest.export — what Slack holds for this app right now."""
+    r = api("apps.manifest.export", config_token, app_id=app_id)
+    if not r.get("ok"):
+        raise RuntimeError("apps.manifest.export failed: %s" % (r.get("error") or r.get("errors")))
+    return r.get("manifest") or {}
+
+
+def merge_manifest(live: dict, ours: dict) -> dict:
+    """Ours wins where we declare something; anything else the app carries survives.
+
+    apps.manifest.update REPLACES — it is not a patch — so pushing our manifest at an app that
+    already exists deletes every field we do not mention. Measured on two dogs made by older
+    versions: a wholesale push would have dropped four keys Slack echoes back (home_tab_enabled,
+    pkce_enabled, is_mcp_enabled, token_rotation_enabled — all false, so all harmless) and would
+    ALSO have turned off interactivity, which was on for reasons this file has no idea about.
+
+    Updating a scope is not a licence to reset everything else, so the rule is: converge what
+    collie declares, and leave alone what it has no opinion on.
+    """
+    out = dict(live)
+    for k, v in (ours or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge_manifest(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def update_app(config_token: str, app_id: str, manifest: dict) -> dict:
+    """apps.manifest.update — the same whole-app call, aimed at one that already exists.
+
+    `permissions_updated` in the reply is the part worth reading: true means the SCOPES changed and
+    a reinstall has to grant them, false means the change was cosmetic and is already live. Both
+    are ordinary outcomes, so both are reported rather than one being treated as a failure.
+    """
+    r = api("apps.manifest.update", config_token, app_id=app_id, manifest=json.dumps(manifest))
+    if not r.get("ok"):
+        detail = r.get("errors") or r.get("error")
+        raise RuntimeError("apps.manifest.update failed: %s" % json.dumps(detail))
+    return r
+
+
+def load_identity(name: str = "", autonomy: str = "") -> dict:
+    """The dog's name, where it lives, and what it may do.
+
+    The name is picked once and kept: deterministic from the hostname so two
+    machines rarely collide, but written to disk immediately so it survives a
+    rename of the machine. Anything passed in wins and is persisted, which is how
+    someone renames a dog they do not like the name of.
+
+    Kept in the KENNEL, keyed by name, not in one identity.json per machine. A machine can run
+    several dogs — that is what the kennel is for — and one shared file gave the second one to
+    start whatever name the first had written: a dog launched without --name answered to its
+    packmate's name, in its packmate's channel, from the wrong repository. identity.json is now
+    read once, to carry an existing autonomy forward, and never written again.
+    """
+    dogs = load_kennel()
+    legacy = {}
+    try:
+        with open(IDENTITY, encoding="utf-8") as f:
+            legacy = json.load(f) or {}
+    except Exception:
+        legacy = {}
+
+    fresh = False
+    if not name:
+        # The same rule the tokens follow two functions down: one dog on this machine is an obvious
+        # default, several is not. Guessing there hands this process the OTHER dog's name — and the
+        # token lookup already refuses that case, so agreeing with it is the whole point.
+        if len(dogs) == 1:
+            name = next(iter(dogs))
+        elif not dogs:
+            name = legacy.get("name") or ""
+            if not name:
+                host = _hostname()
+                name = KENNEL[sum(host.encode()) % len(KENNEL)]
+                fresh = True     # so the first greeting can offer a rename, once
+
+    entry = dict(dogs.get(name) or {})
+    if not entry and legacy.get("name") == name:
+        entry["autonomy"] = legacy.get("autonomy", "")     # one-time carry from the shared file
+    if autonomy:
+        entry["autonomy"] = autonomy
+    if not entry.get("autonomy"):
+        entry["autonomy"] = "propose"
+    if name:
+        dogs[name] = entry
+        save_kennel(dogs)
+
+    ident = {"name": name, "autonomy": entry["autonomy"],
+             "machine": _hostname(), "os": os_label()}
+    if fresh:
+        ident["_fresh"] = True
+    return ident
+
+
+# ---------------------------------------------------------------------------
+# The queue
+# ---------------------------------------------------------------------------
+
+def _message_source_key(channel: str, ts: str) -> str:
+    return "message:%s:%s" % (channel, ts) if channel and ts else ""
+
+
+def _legacy_signature(channel: str, thread: str, user: str, text: str) -> str:
+    raw = "\0".join((channel, thread, user, text)).encode("utf-8", "replace")
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+_LEGACY_REDELIVERY_WINDOW = 10 * 60
+
+
+def _matching_legacy_receipt(receipts: list[str], channel: str, thread: str,
+                             user: str, text: str, event_ts: str) -> str:
+    """Return one ambiguous pre-receipt marker only near its original enqueue.
+
+    Old queue rows did not retain Slack's event id or message timestamp.  A
+    short tuple/time match bridges one upgrade-time redelivery, but it must not
+    suppress a perfectly legitimate repeat of the same words hours or days
+    later.  The caller consumes this marker as soon as it can replace it with
+    Slack's exact identifiers.
+    """
+    try:
+        when = float(event_ts)
+    except (TypeError, ValueError):
+        return ""
+    signature = _legacy_signature(channel, thread, user, text)
+    for receipt in receipts:
+        if not receipt.startswith("legacy:"):
+            continue
+        try:
+            _, queued, saved = receipt.split(":", 2)
+            if (saved == signature
+                    and abs(when - float(queued)) <= _LEGACY_REDELIVERY_WINDOW):
+                return receipt
+        except ValueError:
+            continue
+    return ""
+
+
+class QueuePersistenceError(RuntimeError):
+    """The queue could not durably record a state transition."""
+
+
+class QueueFullError(QueuePersistenceError):
+    """The live queue was full, but the rejected ask was durably dead-lettered."""
+
+    def __init__(self, task_id: int, capacity: int):
+        self.task_id = int(task_id)
+        self.capacity = int(capacity)
+        super().__init__("queue capacity %d reached; ask saved as dead letter #%d" %
+                         (self.capacity, self.task_id))
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a recorded guard process still exists, without signalling it."""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return bool(ok and code.value == 259)       # STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _process_identity(pid: int) -> str:
+    """Creation identity paired with a PID, so PID reuse cannot hold a fence."""
+    try:
+        if not _pid_alive(pid):
+            return ""
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            handle = k.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return ""
+            try:
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                if not k.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                         ctypes.byref(kernel), ctypes.byref(user)):
+                    return ""
+                return "%08x%08x" % (created.dwHighDateTime, created.dwLowDateTime)
+            finally:
+                k.CloseHandle(handle)
+        try:
+            with open("/proc/%d/stat" % int(pid), encoding="ascii") as f:
+                return f.read().split()[21]
+        except FileNotFoundError:
+            # macOS has no /proc. This is recovery-only and never handles task
+            # text, so invoking ps directly is bounded and shell-free.
+            return subprocess.check_output(
+                ["ps", "-o", "lstart=", "-p", str(int(pid))],
+                text=True, timeout=2).strip()
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return ""
+
+
+def _same_process(pid: int, started: str) -> bool:
+    # A legacy PID without a creation identity is never authoritative.  With a
+    # persisted identity, however, a live PID plus a transient identity lookup
+    # failure must fail closed: only a positive mismatch proves PID reuse.
+    if not started or not _pid_alive(pid):
+        return False
+    current = _process_identity(pid)
+    return not current or current == started
+
+
+def _execution_alive(item: dict) -> bool:
+    """Whether either the supervisor or its gated executor is still alive."""
+    if _same_process(item.get("guard_pid", 0), item.get("guard_started", "")):
+        return True
+    state = item.get("guard_state", "")
+    if state:
+        try:
+            with open(state, encoding="utf-8") as f:
+                saved = json.load(f) or {}
+                return _same_process(saved.get("exec_pid", 0), saved.get("exec_started", ""))
+        except (OSError, ValueError, TypeError):
+            pass
+    return False
+
+
+class SlackInstanceLock:
+    """One live Slack listener per dog, released by the OS when its process dies."""
+
+    def __init__(self, name: str):
+        safe = re.sub(r"[^a-z0-9_.-]", "_", name.lower())
+        os.makedirs(QUEUE_DIR, exist_ok=True)
+        self.path = os.path.join(QUEUE_DIR, "slack-%s.lock" % safe)
+        self._file = open(self.path, "a+b")
+        self._file.seek(0, os.SEEK_END)
+        if self._file.tell() == 0:
+            self._file.write(b"\0")
+            self._file.flush()
+        self._file.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError) as e:
+            self._file.close()
+            self._file = None
+            raise RuntimeError("Slack dog %s is already running" % name) from e
+
+    def close(self):
+        f = self._file
+        if f is None:
+            return
+        try:
+            f.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+            self._file = None
+
+
+class TaskQueue:
+    """FIFO of asks, persisted so a restart does not silently drop work.
+
+    Persistence is the whole point: a queue that lives in memory turns "I asked it
+    an hour ago" into "it never heard me" the first time the process is restarted,
+    and there is nothing on screen to tell the difference.
+    """
+
+    def __init__(self, name: str, recover_running: bool = False,
+                 capacity: int | None = None, dead_letter_capacity: int | None = None):
+        self.path = os.path.join(QUEUE_DIR, "queue-%s.json" % name.lower())
+        self._lock = threading.Lock()
+        self.items: list[dict] = []
+        self.next_id = 1
+        self.receipts: list[str] = []
+        try:
+            default_capacity = int(os.environ.get("COLLIE_SLACK_QUEUE_CAP", "500"))
+        except ValueError:
+            default_capacity = 500
+        try:
+            default_dead_capacity = int(os.environ.get("COLLIE_SLACK_DLQ_CAP", "1000"))
+        except ValueError:
+            default_dead_capacity = 1000
+        self.capacity = max(1, int(default_capacity if capacity is None else capacity))
+        self.dead_letter_capacity = max(
+            1, int(default_dead_capacity if dead_letter_capacity is None
+                   else dead_letter_capacity))
+        self.dead_letters: list[dict] = []
+        self._load(recover_running)
+
+    def _load(self, recover_running: bool):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            # This file is the authority for work that may already have made
+            # external changes.  A malformed file is not an empty queue.
+            raise QueuePersistenceError(
+                "cannot read %s; it was left untouched" % self.path) from e
+        if (not isinstance(d, dict) or not isinstance(d.get("items", []), list)
+                or not isinstance(d.get("next_id", 1), int)
+                or not isinstance(d.get("receipts", []), list)
+                or not isinstance(d.get("dead_letters", []), list)):
+            raise QueuePersistenceError("invalid queue data in %s" % self.path)
+        self.items = [dict(item) for item in d.get("items", [])]
+        self.next_id = d.get("next_id", 1)
+        self.receipts = [str(key) for key in d.get("receipts", [])][-5000:]
+        self.dead_letters = [dict(item) for item in d.get("dead_letters", [])]
+        migrated = False
+        # Old queue files predate event_id receipts, but they do retain the
+        # message ts. Tombstone that stable key before Slack can redeliver the
+        # already-accepted mention during this upgrade.
+        for item in self.items:
+            key = _message_source_key(item.get("channel", ""), item.get("ask_ts", ""))
+            if key and key not in self.receipts:
+                self.receipts.append(key)
+                migrated = True
+            elif not item.get("source_id"):
+                try:
+                    queued_at = float(item.get("queued_at", 0) or 0)
+                except (TypeError, ValueError):
+                    queued_at = 0.0
+                legacy = "legacy:%.3f:%s" % (
+                    queued_at,
+                    _legacy_signature(item.get("channel", ""), item.get("thread", ""),
+                                      item.get("user", ""), item.get("text", "")))
+                if legacy not in self.receipts:
+                    self.receipts.append(legacy)
+                    migrated = True
+        self.receipts = self.receipts[-5000:]
+        if recover_running:
+            # A process cannot still own a `running` item after that process has
+            # gone away: the caller holds SlackInstanceLock, so no same-name
+            # worker can still be alive. Do not silently rerun it, though.
+            recovered, discard = False, []
+            for item in self.items:
+                if item.get("state") == "running":
+                    if _execution_alive(item):
+                        # The old listener is gone, but its guard is still
+                        # terminating the execution tree. Never overlap a retry.
+                        item["state"] = "orphaned"
+                    else:
+                        item["state"] = "interrupted"
+                        item["interrupted_at"] = time.time()
+                    recovered = True
+                elif item.get("state") == "orphaned" and not _execution_alive(item):
+                    item["state"] = "interrupted"
+                    item["interrupted_at"] = time.time()
+                    discard.append(item.get("guard_state", ""))
+                    item.pop("guard_pid", None)
+                    item.pop("guard_started", None)
+                    item.pop("guard_state", None)
+                    recovered = True
+                elif item.get("state") == "delivering":
+                    # The Slack post may have landed before the process died.
+                    # Keep the completed result, but require a person to inspect
+                    # the thread before choosing retry (delivery only) or drop.
+                    item["state"] = "delivery_interrupted"
+                    item["interrupted_at"] = time.time()
+                    recovered = True
+            if recovered or migrated:
+                self._write(self.items, self.next_id, self.receipts)
+                for path in discard:
+                    self._discard_guard_state(path)
+        elif migrated:
+            self._write(self.items, self.next_id, self.receipts)
+
+    def _write(self, items: list[dict], next_id: int, receipts: list[str] | None = None,
+               dead_letters: list[dict] | None = None):
+        """Atomically persist a proposed state before exposing or acting on it."""
+        tmp = "%s.tmp-%d-%d" % (self.path, os.getpid(), threading.get_ident())
+        try:
+            os.makedirs(QUEUE_DIR, exist_ok=True)
+            try:
+                os.chmod(QUEUE_DIR, 0o700)
+            except OSError:
+                pass
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"items": items, "next_id": next_id,
+                           "receipts": self.receipts if receipts is None else receipts,
+                           "dead_letters": (self.dead_letters if dead_letters is None
+                                            else dead_letters)}, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, self.path)
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise QueuePersistenceError("cannot persist %s" % self.path) from e
+
+    def _commit(self, items: list[dict], next_id: int | None = None,
+                receipts: list[str] | None = None,
+                dead_letters: list[dict] | None = None):
+        new_next = self.next_id if next_id is None else next_id
+        new_receipts = self.receipts if receipts is None else receipts
+        new_dead = self.dead_letters if dead_letters is None else dead_letters
+        # Keep the long-standing three-argument _write seam used by fault-injection tests and
+        # downstream wrappers. The fourth argument is only required when the DLQ itself changes.
+        if dead_letters is None:
+            self._write(items, new_next, new_receipts)
+        else:
+            self._write(items, new_next, new_receipts, new_dead)
+        self.items, self.next_id, self.receipts, self.dead_letters = (
+            items, new_next, new_receipts, new_dead)
+
+    def _discard_guard_state(self, path: str):
+        """Remove only an attempt file derived from this exact queue path."""
+        if not path:
+            return
+        full, prefix = os.path.abspath(path), os.path.abspath(self.path) + ".guard-"
+        if not full.startswith(prefix) or os.path.dirname(full) != os.path.dirname(prefix):
+            return
+        try:
+            os.remove(full)
+        except OSError:
+            pass
+
+    def add(self, text: str, channel: str, thread: str, user: str,
+            from_dog: bool = False, ask_ts: str = "", source_id: str = "") -> dict | None:
+        with self._lock:
+            if self._duplicate_locked(source_id, channel, ask_ts, thread, user, text):
+                return None
+            item = {"id": self.next_id, "text": text, "channel": channel,
+                    "thread": thread, "user": user, "state": "waiting",
+                    "from_dog": from_dog,      # kept for `queue`/receipts: who is waiting on this
+                    "ask_ts": ask_ts,
+                    "source_id": source_id,
+                    "queued_at": time.time()}
+            items = [dict(i) for i in self.items] + [item]
+            message_id = _message_source_key(channel, ask_ts)
+            keys = [key for key in (source_id, message_id)
+                    if key and key not in self.receipts]
+            receipts = (self.receipts + keys)[-5000:]
+            if len(self.items) >= self.capacity:
+                if len(self.dead_letters) >= self.dead_letter_capacity:
+                    # Do not ACK: Socket Mode may redeliver after an operator creates room.
+                    raise QueuePersistenceError(
+                        "queue capacity %d and dead-letter capacity %d are both full" %
+                        (self.capacity, self.dead_letter_capacity))
+                dead = dict(item)
+                dead.update({"state": "dead", "dead_at": time.time(),
+                             "dead_reason": "queue capacity exceeded"})
+                self._commit([dict(i) for i in self.items], self.next_id + 1, receipts,
+                             self.dead_letters + [dead])
+                raise QueueFullError(dead["id"], self.capacity)
+            self._commit(items, self.next_id + 1, receipts)
+            return self.items[-1]
+
+    def take(self) -> dict | None:
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            for n, item in enumerate(items):
+                state = item.get("state", "")
+                # Only an outcome-unknown EXECUTION fences the working tree.
+                # Completed outbox items are independent and must not freeze
+                # later work because Slack had a transient posting problem.
+                if state in ("running", "interrupted", "orphaned"):
+                    return None
+                if state in ("delivery_failed", "delivery_interrupted", "delivering"):
+                    continue
+                if state not in ("waiting", "delivery_ready"):
+                    return None
+                item["state"] = "running" if state == "waiting" else "delivering"
+                self._commit(items)
+                return self.items[n]
+            return None
+
+    def finish(self, task_id: int):
+        with self._lock:
+            self._commit([dict(i) for i in self.items if i["id"] != task_id])
+
+    def complete(self, task_id: int, text: str, ok: bool) -> dict | None:
+        """Persist a completed run and its answer before trying Slack delivery."""
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            for n, item in enumerate(items):
+                if item["id"] == task_id:
+                    guard_state = item.get("guard_state", "")
+                    # Linearize completion against a durable stop intent. If
+                    # stop won this queue lock, the answer must not overwrite
+                    # it with `delivering` and then delete the task.
+                    if item.get("stop_requested_at"):
+                        item["state"] = "interrupted"
+                        item["interrupted_at"] = time.time()
+                        item.pop("guard_pid", None)
+                        item.pop("guard_started", None)
+                        item.pop("guard_state", None)
+                        self._commit(items)
+                        self._discard_guard_state(guard_state)
+                        return None
+                    item["state"] = "delivering"
+                    item["delivery_text"] = text
+                    item["delivery_ok"] = bool(ok)
+                    item["completed_at"] = time.time()
+                    item.pop("guard_pid", None)
+                    item.pop("guard_started", None)
+                    item.pop("guard_state", None)
+                    self._commit(items)
+                    self._discard_guard_state(guard_state)
+                    return self.items[n]
+            raise QueuePersistenceError("task #%d vanished before completion" % task_id)
+
+    def attach_process(self, task_id: int, pid: int, state_path: str):
+        """Record the execution guard before allowing its child to start."""
+        started = _process_identity(pid)
+        if not started:
+            raise QueuePersistenceError("cannot identify execution guard %s" % pid)
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            for item in items:
+                if item["id"] == task_id:
+                    item["guard_pid"] = int(pid)
+                    item["guard_started"] = started
+                    item["guard_state"] = state_path
+                    self._commit(items)
+                    return
+            raise QueuePersistenceError("task #%d vanished before process attach" % task_id)
+
+    def reap_orphans(self) -> int:
+        """Resolve guards that finished shutting down after their parent died."""
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            changed, discard = 0, []
+            for item in items:
+                if item.get("state") == "orphaned" and not _execution_alive(item):
+                    item["state"] = "interrupted"
+                    item["interrupted_at"] = time.time()
+                    discard.append(item.get("guard_state", ""))
+                    item.pop("guard_pid", None)
+                    item.pop("guard_started", None)
+                    item.pop("guard_state", None)
+                    changed += 1
+            if changed:
+                self._commit(items)
+                for path in discard:
+                    self._discard_guard_state(path)
+            return changed
+
+    def mark_orphaned(self, task_id: int, pid: int):
+        """Fence recovery while an old execution guard is still shutting down."""
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            for item in items:
+                if item["id"] == task_id:
+                    item["state"] = "orphaned"
+                    item["guard_pid"] = int(pid)
+                    self._commit(items)
+                    return
+
+    def delivery_failed(self, task_id: int):
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            for item in items:
+                if item["id"] == task_id:
+                    # A transport timeout cannot tell "not posted" from "Slack
+                    # accepted it and the response was lost". Even a known-good
+                    # post can be followed by a failed queue cleanup. Both are
+                    # outcome-unknown and require inspecting the thread.
+                    item["state"] = "delivery_interrupted"
+                    item["delivery_failed_at"] = time.time()
+                    self._commit(items)
+                    return
+
+    def interrupt(self, task_id: int):
+        """Keep a crashed task, but never guess that repeating it is safe."""
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            for item in items:
+                if item["id"] == task_id:
+                    guard_state = item.get("guard_state", "")
+                    item["state"] = ("delivery_interrupted"
+                                     if item.get("delivery_text") else "interrupted")
+                    item["interrupted_at"] = time.time()
+                    item.pop("guard_pid", None)
+                    item.pop("guard_started", None)
+                    item.pop("guard_state", None)
+                    self._commit(items)
+                    self._discard_guard_state(guard_state)
+                    return
+
+    def _control_receipts_locked(self, source_id: str, channel: str,
+                                 ask_ts: str) -> tuple[list[str], bool]:
+        keys = [key for key in (source_id, _message_source_key(channel, ask_ts)) if key]
+        seen = any(key in self.receipts for key in keys)
+        receipts = list(self.receipts)
+        receipts.extend(key for key in keys if key not in receipts)
+        return receipts[-5000:], seen
+
+    def record_event(self, source_id: str, channel: str, ask_ts: str) -> bool:
+        """Persist a non-task event before ACK; false means it was already handled."""
+        with self._lock:
+            receipts, seen = self._control_receipts_locked(source_id, channel, ask_ts)
+            if seen:
+                return False
+            if receipts != self.receipts:
+                self._commit([dict(item) for item in self.items], receipts=receipts)
+            return True
+
+    def record_stop(self, source_id: str, channel: str, ask_ts: str) -> int:
+        """Atomically bind one stop event to the execution running right now.
+
+        Returns its task id, 0 when there is no execution, and -1 for a
+        duplicate control event. The receipt and target marker share one queue
+        commit, so delayed redelivery can never stop a later task.
+        """
+        with self._lock:
+            receipts, seen = self._control_receipts_locked(source_id, channel, ask_ts)
+            if seen:
+                return -1
+            items = [dict(item) for item in self.items]
+            target = next((item for item in items if item.get("state") == "running"), None)
+            if target is not None:
+                target["stop_requested_at"] = time.time()
+                if source_id:
+                    target["stop_source_id"] = source_id
+            if target is not None or receipts != self.receipts:
+                self._commit(items, receipts=receipts)
+            return int(target["id"]) if target is not None else 0
+
+    def stop_requested(self, task_id: int) -> bool:
+        with self._lock:
+            return any(item.get("id") == task_id and item.get("stop_requested_at")
+                       for item in self.items)
+
+    def retry(self, task_id: int, confirm_delivery: bool = False,
+              source_id: str = "", channel: str = "", ask_ts: str = "") -> str:
+        """Explicitly put an outcome-unknown task back at the head of the FIFO."""
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            receipts, seen = self._control_receipts_locked(source_id, channel, ask_ts)
+            if seen:
+                return "that retry event was already handled"
+
+            def finish_control(answer: str, changed: bool = False) -> str:
+                if changed or receipts != self.receipts:
+                    self._commit(items, receipts=receipts)
+                return answer
+
+            for item in items:
+                if item["id"] != task_id:
+                    continue
+                if item["state"] == "orphaned":
+                    return finish_control(
+                        "#%d's old process tree is still shutting down — wait." % task_id)
+                if item["state"] in ("running", "delivering"):
+                    return finish_control("#%d is still running — say `stop` first." % task_id)
+                if item["state"] in ("waiting", "delivery_ready"):
+                    return finish_control("#%d is already waiting" % task_id)
+                if item["state"] == "interrupted":
+                    item["state"] = "waiting"
+                    answer = "retrying #%d" % task_id
+                elif item["state"] in ("delivery_failed", "delivery_interrupted"):
+                    if not confirm_delivery:
+                        return finish_control(
+                            "#%d has a completed answer whose Slack delivery is uncertain. "
+                            "Inspect the thread, then say `retry delivery %d` or `drop %d`." %
+                            (task_id, task_id, task_id))
+                    item["state"] = "delivery_ready"
+                    item.pop("delivery_failed_at", None)
+                    answer = ("retrying delivery for #%d (the work will not run again; "
+                              "the Slack reply may repeat)" % task_id)
+                else:
+                    return finish_control(
+                        "#%d cannot be retried from %s" % (task_id, item["state"]))
+                item.pop("interrupted_at", None)
+                item.pop("stop_requested_at", None)
+                item.pop("stop_source_id", None)
+                # Retried work goes first: it already waited once, and leaving it
+                # behind newer asks makes recovery look as if it did nothing.
+                items.remove(item)
+                items.insert(0, item)
+                return finish_control(answer, changed=True)
+            return finish_control("no #%d in the queue" % task_id)
+
+    def drop(self, task_id: int, source_id: str = "", channel: str = "",
+             ask_ts: str = "") -> str:
+        """Remove a task that has not started. A running one is not dropped from
+        under itself — `stop` is the word for that, and conflating the two is how
+        someone cancels a half-written commit by accident."""
+        with self._lock:
+            items = [dict(i) for i in self.items]
+            receipts, seen = self._control_receipts_locked(source_id, channel, ask_ts)
+            if seen:
+                return "that drop event was already handled"
+
+            def finish_control(answer: str, changed: bool = False) -> str:
+                if changed or receipts != self.receipts:
+                    self._commit(items, receipts=receipts)
+                return answer
+
+            for item in items:
+                if item["id"] == task_id:
+                    if item["state"] == "orphaned":
+                        return finish_control(
+                            "#%d's old process tree is still shutting down — wait." % task_id)
+                    if item["state"] in ("running", "delivering"):
+                        return finish_control(
+                            "#%d is already running — say `stop` to interrupt it." % task_id)
+                    items.remove(item)
+                    return finish_control("dropped #%d" % task_id, changed=True)
+            return finish_control("no #%d in the queue" % task_id)
+
+    def listing(self) -> str:
+        with self._lock:
+            if not self.items:
+                return ("queue is empty" if not self.dead_letters else
+                        "queue is empty; %d ask(s) are in the dead-letter queue" %
+                        len(self.dead_letters))
+            out = []
+            for it in self.items:
+                mark = ({"running": "▶", "orphaned": "▶", "delivering": "▶", "interrupted": "⚠",
+                         "delivery_failed": "↥", "delivery_interrupted": "↥",
+                         "delivery_ready": "↥"}.get(it["state"], "·"))
+                out.append("%s #%d  %s" % (mark, it["id"], it["text"][:70]))
+            if self.dead_letters:
+                out.append("⚠ %d ask(s) are in the dead-letter queue" % len(self.dead_letters))
+            return "\n".join(out)
+
+    def dead_letter_count(self) -> int:
+        with self._lock:
+            return len(self.dead_letters)
+
+    def waiting(self) -> int:
+        with self._lock:
+            return sum(1 for i in self.items if i["state"] == "waiting")
+
+    def unresolved(self) -> int:
+        with self._lock:
+            return sum(1 for i in self.items if i["state"] in (
+                "interrupted", "orphaned", "delivery_failed", "delivery_interrupted"))
+
+    def has_receipt(self, source_id: str) -> bool:
+        with self._lock:
+            return bool(source_id and source_id in self.receipts)
+
+    def _duplicate_locked(self, source_id: str, channel: str, ask_ts: str,
+                          thread: str, user: str, text: str) -> bool:
+        """Check exact receipts and atomically retire one legacy fuzzy marker."""
+        message_id = _message_source_key(channel, ask_ts)
+        if ((source_id and source_id in self.receipts)
+                or (message_id and message_id in self.receipts)):
+            return True
+
+        legacy = _matching_legacy_receipt(
+            self.receipts, channel, thread, user, text, ask_ts)
+        if not legacy:
+            return False
+
+        # Once Slack supplies exact identifiers, consume the fuzzy marker.  A
+        # future distinct event with identical text must be allowed through.
+        keys = [key for key in (source_id, message_id) if key]
+        if keys:
+            items = [dict(item) for item in self.items]
+            for item in items:
+                try:
+                    queued_at = float(item.get("queued_at", 0) or 0)
+                except (TypeError, ValueError):
+                    queued_at = 0.0
+                marker = "legacy:%.3f:%s" % (
+                    queued_at,
+                    _legacy_signature(item.get("channel", ""), item.get("thread", ""),
+                                      item.get("user", ""), item.get("text", "")))
+                if marker == legacy:
+                    item["source_id"] = source_id
+                    item["ask_ts"] = ask_ts
+                    break
+            receipts = [receipt for receipt in self.receipts if receipt != legacy]
+            receipts.extend(key for key in keys if key not in receipts)
+            self._commit(items, receipts=receipts[-5000:])
+        return True
+
+    def is_duplicate(self, source_id: str, channel: str, ask_ts: str,
+                     thread: str, user: str, text: str) -> bool:
+        """Durably recognize a Socket Mode retry before acknowledging it."""
+        with self._lock:
+            return self._duplicate_locked(source_id, channel, ask_ts, thread, user, text)
+
+
+# ---------------------------------------------------------------------------
+# Slack Web API
+# ---------------------------------------------------------------------------
+
+def api(method: str, token: str, **params) -> dict:
+    """One POST to the Slack Web API.
+
+    Raises on a transport failure and returns the parsed body otherwise; Slack
+    signals its own failures with `ok: false` in a 200, so the caller checks that.
+    """
+    data = json.dumps(params).encode("utf-8")
+    req = urllib.request.Request(
+        SLACK_API + method, data=data,
+        headers={"Content-Type": "application/json; charset=utf-8",
+                 "Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def api_q(method: str, token: str, **params) -> dict:
+    """Same, FORM-encoded — for the query methods that will not read a JSON body.
+
+    Slack's write methods (chat.postMessage, conversations.join) take application/json. Its
+    lookup methods do not: conversations.members and users.info silently ignore a JSON body and
+    answer `invalid_arguments — missing required field: channel` for a call that plainly carried
+    one. Sent as a form they work. The split is Slack's, so it is a second function rather than a
+    guess inside the first: a caller picks the encoding its method actually accepts.
+    """
+    data = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
+    req = urllib.request.Request(
+        SLACK_API + method, data=data.encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                 "Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def join(token: str, channel: str, name: str = "collie") -> str:
+    """Walk into a channel. "" on success, else the reason, in words.
+
+    Run on every start, not only the first: already being in the channel is a success, and the
+    alternative — a dog that is connected, listening and simply not a member — is indistinguishable
+    from a dog nobody has spoken to yet. That failure is silent on both ends, which is why it is
+    worth a call that usually does nothing.
+    """
+    try:
+        r = api("conversations.join", token, channel=channel)
+    except Exception as e:
+        return str(e)
+    if r.get("ok") or r.get("error") == "already_in_channel":
+        return ""
+    if r.get("error") == "missing_scope":
+        return ("this app predates `channels:join` — reinstall it from its Slack app page to pick "
+                "the scope up, or `/invite @%s` in the channel once" % name.lower())
+    if r.get("error") == "method_not_supported_for_channel_type":
+        return "private channel — nothing may let itself in; `/invite @%s` once" % name.lower()
+    if r.get("error") == "channel_not_found":
+        return "no such channel, or it is private and this app cannot see it"
+    return str(r.get("error"))
+
+
+# Who else is in the room. The rule is one sentence: a dog sees what a PERSON IN THAT CHANNEL sees.
+#
+# It is needed because addressing anyone in Slack means writing a <@U…> id, and a dog had no way to
+# learn one. Asked to greet the two other dogs in its channel it answered "there is only one collie
+# here, tell me what they are called" — which was accurate. The kennel could not help: it is keyed
+# by name, holds no ids, and lives on ONE machine, while the pack is spread across several. Slack is
+# the thing all of them share, so Slack is where the roster comes from.
+_ROSTER_TTL = 120.0                 # seconds; a member list changes on human timescales
+_roster_cache: dict = {}            # channel -> (fetched_at, [member, …])
+_roster_warned = False              # the missing-scope note is worth saying once, not every ask
+
+
+def roster(token: str, channel: str, now: float = 0.0) -> list:
+    """[{id, name, is_bot}] for one channel, newest-first-effort and cached.
+
+    Never raises and never blocks a run: a roster that cannot be fetched comes back empty, and an
+    empty roster costs the dog the ability to address anyone — not the ability to answer. An app
+    provisioned before these scopes existed returns missing_scope here, which is exactly that case.
+    """
+    now = now or time.time()
+    hit = _roster_cache.get(channel)
+    if hit and (now - hit[0]) < _ROSTER_TTL:
+        return hit[1]
+    out = []
+    try:
+        ids, cursor = [], ""
+        for _ in range(10):                       # bounded: a channel is not an unbounded page walk
+            r = api_q("conversations.members", token, channel=channel, limit=200, cursor=cursor)
+            if not r.get("ok"):
+                # Say it ONCE, and say what to do. A dog provisioned before these scopes existed
+                # lands here on every ask, and an empty roster is invisible from the channel: it
+                # looks like a dog that chose not to answer anyone. Silence is how every other bug
+                # in this file stayed alive.
+                global _roster_warned
+                if r.get("error") == "missing_scope" and not _roster_warned:
+                    _roster_warned = True
+                    print("[slack] no roster: this app predates `channels:read`/`users:read` — "
+                          "reinstall it from its Slack app page to pick them up. It can still "
+                          "answer; it cannot address anyone.", file=sys.stderr)
+                return []
+            ids += r.get("members") or []
+            cursor = ((r.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                break
+        for uid in ids:
+            u = api_q("users.info", token, user=uid)
+            if not u.get("ok"):
+                continue
+            m = u.get("user") or {}
+            p = m.get("profile") or {}
+            nm = (p.get("display_name") or p.get("real_name") or m.get("name") or uid).strip()
+            out.append({"id": uid, "name": nm, "is_bot": bool(m.get("is_bot"))})
+    except Exception:
+        return []
+    _roster_cache[channel] = (now, out)
+    return out
+
+
+def roster_line(members: list, me: str = "") -> str:
+    """The roster as one line for the run's prompt, or "" when there is nobody to name."""
+    others = [m for m in members if m["id"] != me]
+    if not others:
+        return ""
+    dogs = ["%s <@%s>" % (m["name"], m["id"]) for m in others if m["is_bot"]]
+    folk = ["%s <@%s>" % (m["name"], m["id"]) for m in others if not m["is_bot"]]
+    parts = []
+    if dogs:
+        parts.append("collies: " + ", ".join(dogs))
+    if folk:
+        parts.append("people: " + ", ".join(folk))
+    return ("Also in this channel — %s. To address one, copy its <@…> token into your reply; that "
+            "is what reaches them." % "; ".join(parts))
+
+
+# Matches the plain <@U123> and the older labelled <@U123|name>. Deliberately wider than MENTION_RE:
+# that one strips the dog's own mention out of an ask, where missing a form is harmless, while this
+# one decides who a reply is allowed to ping, where missing a form is the whole failure.
+_MENTION_ANY = re.compile(r"<@([UW][A-Z0-9]+)(\|[^>]*)?>")
+
+
+def keep_known_mentions(text: str, members: list) -> str:
+    """Drop <@…> tokens from an outgoing answer that name nobody in this channel.
+
+    The answer is posted as ordinary text precisely so a mention in it reaches someone — which is
+    also why an id the model invented would reach someone. The bound is the ROSTER, not the wording
+    of the ask: a person in a channel may @ anyone in it, so a dog may too, and no further. With an
+    empty roster nothing is known to be addressable and every token goes, which is the safe way for
+    a failed lookup to fail.
+    """
+    ok = {m["id"] for m in members}
+    return _MENTION_ANY.sub(lambda mo: mo.group(0) if mo.group(1) in ok else "", text)
+
+
+def say(token: str, channel: str, text: str, thread: str = "",
+        broadcast: bool = False) -> str:
+    """Reply in the thread the ask arrived in. Returns the message ts, so it can be edited.
+
+    In-thread on purpose: one run's output is long, and a channel that fills with it stops being
+    somewhere anyone reads. But a thread is also where an answer goes to be missed — so the one
+    message that is actually an ANSWER is sent with `reply_broadcast`, which keeps it a thread reply
+    and still surfaces it in the channel. Progress stays quiet; conclusions do not.
+
+    No name prefix. Every message used to open with "Cornetto · HUO4S4H — ", which Slack already
+    shows above it in the avatar and the name — and the machine half is noise to everyone except
+    the person who owns the machine. `who` still says where a dog lives, on request.
+    """
+    try:
+        p = {"channel": channel, "text": text}
+        if thread:
+            p["thread_ts"] = thread
+            if broadcast:
+                p["reply_broadcast"] = "true"
+        r = api("chat.postMessage", token, **p)
+        if not r.get("ok"):
+            print("[slack] postMessage failed: %s" % r.get("error"), file=sys.stderr)
+            return ""
+        return r.get("ts", "")
+    except Exception as e:
+        print("[slack] postMessage error: %s" % e, file=sys.stderr)
+        return ""
+
+
+# The three states a request can be in, as the marks a person would leave on it.
+SEEN, DONE, FAILED = "eyes", "white_check_mark", "warning"
+
+
+def react(token: str, channel: str, ts: str, emoji: str, on: bool = True) -> None:
+    """Put the state ON the ask, rather than posting a line about it. Never fatal.
+
+    An app provisioned before `reactions:write` existed answers missing_scope here, and the right
+    outcome then is a dog that works without status marks — not a dog that stops. Same for
+    already_reacted, which is what a retry looks like and is not a problem to report.
+    """
+    if not ts:
+        return
+    try:
+        api("reactions.add" if on else "reactions.remove", token,
+            channel=channel, timestamp=ts, name=emoji)
+    except Exception:
+        pass
+
+
+def edit(token: str, channel: str, ts: str, text: str) -> bool:
+    """Rewrite a message already sent. One ask used to produce `queued #1` and `on it — #1` a second
+    apart — two messages for one fact — before the result made a third. A status that CHANGES should
+    be one line that changes, not a transcript of its own state machine.
+
+    No name prefix, for the same reason `say` dropped it: Slack shows who spoke, above the message.
+    """
+    if not ts:
+        return False
+    try:
+        r = api("chat.update", token, channel=channel, ts=ts, text=text)
+        if not r.get("ok"):
+            print("[slack] update failed: %s" % r.get("error"), file=sys.stderr)
+        return bool(r.get("ok"))
+    except Exception as e:
+        print("[slack] update error: %s" % e, file=sys.stderr)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# The worker
+# ---------------------------------------------------------------------------
+
+class Worker(threading.Thread):
+    """Runs one task at a time, in this repository.
+
+    One at a time is not laziness. Two runs in one working tree edit the same
+    files, and the second one's diff would be built on the first one's half-done
+    state — the queue exists precisely so a second ask waits rather than
+    corrupting the first.
+    """
+
+    def __init__(self, q: TaskQueue, ident: dict, bot_token: str, cwd: str, provider: str):
+        super().__init__(daemon=True)
+        # NOT self.ident: Worker is a Thread, and Thread.ident is a read-only property holding the
+        # thread id. Assigning to it raises AttributeError in the constructor, which is why this
+        # command has never started since it shipped — the crash is before the first connection, so
+        # nothing ever reached Slack to show it was broken.
+        self.q, self.dog, self.token = q, ident, bot_token
+        self.cwd, self.provider = cwd, provider
+        # This dog's own Slack user id, so the roster it is handed does not introduce it to itself.
+        # auth.test needs no scope, so this works on an app provisioned before the roster existed.
+        try:
+            self.me = (api("auth.test", bot_token) or {}).get("user_id", "")
+        except Exception:
+            self.me = ""
+        self.current: subprocess.Popen | None = None
+        self._current_item: dict | None = None
+        self._guard = None
+        self._process_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._shutdown = threading.Event()
+        self._stop_requested = threading.Event()
+        # A terminal queue write can fail after its process tree is already
+        # gone.  Keep that reconciliation in memory and fence all later work
+        # until the durable state catches up; otherwise one transient disk
+        # error leaves a forever-`running` row in an otherwise live listener.
+        self._pending_recovery: tuple[str, int, int] | None = None
+
+    def nudge(self):
+        self._wake.set()
+
+    def shutdown(self):
+        """End the worker loop; primarily useful to make lifecycle tests finite."""
+        self._shutdown.set()
+        self._wake.set()
+
+    def stop_current(self, source_id: str = "", channel: str = "",
+                     ask_ts: str = "") -> str:
+        # Bind the source event to the queue's current running id first. q.take
+        # commits `running` before returning, so this also sees the narrow claim
+        # window in which _current_item has not yet been published. Only after
+        # that receipt+target commit may cancellation touch a process.
+        target_id = self.q.record_stop(source_id, channel, ask_ts)
+        if target_id < 0:
+            return "that stop event was already handled"
+        if not target_id:
+            return "nothing running"
+        self._stop_requested.set()
+        with self._process_lock:
+            # `_current_item` is set as soon as take() claims it, before roster
+            # lookup or spawn. This closes the old claim→Popen stop race.
+            if (self._current_item is None
+                    or int(self._current_item.get("id", 0)) != target_id):
+                self._stop_requested.clear()
+                return "stop recorded for #%d; its owner is recovering" % target_id
+            guard = self._guard
+            self._guard = None
+            if guard is not None:
+                try:
+                    guard.close()       # EOF makes slackguard terminate the whole tree
+                except OSError:
+                    pass
+            return "asked task #%d to stop" % target_id
+
+    def _abort_current(self) -> int:
+        """Close the parent-life pipe and wait for slackguard to kill its tree.
+
+        Returns a still-live guard PID only when shutdown itself timed out.
+        """
+        with self._process_lock:
+            guard, self._guard = self._guard, None
+            process = self.current
+            if guard is not None:
+                try:
+                    guard.close()
+                except OSError:
+                    pass
+        if process is None:
+            return 0
+        try:
+            if process.poll() is None:
+                process.wait(timeout=15)
+        except (subprocess.TimeoutExpired, OSError):
+            return int(getattr(process, "pid", 0) or 0)
+        return 0
+
+    def _defer_recovery(self, action: str, task_id: int, pid: int = 0):
+        self._pending_recovery = (action, int(task_id), int(pid or 0))
+        self._wake.set()
+
+    def _reconcile_pending(self) -> bool:
+        """Retry a failed terminal write; false means later work stays fenced."""
+        pending = self._pending_recovery
+        if pending is None:
+            return True
+        action, task_id, pid = pending
+        try:
+            if action == "orphan":
+                self.q.mark_orphaned(task_id, pid)
+            elif action == "delivery":
+                self.q.delivery_failed(task_id)
+            else:
+                self.q.interrupt(task_id)
+        except Exception as e:
+            print("[slack] queue reconciliation for task #%d failed: %s" %
+                  (task_id, e), file=sys.stderr)
+            return False
+        if self._pending_recovery == pending:
+            self._pending_recovery = None
+        return True
+
+    def _should_stop(self, item: dict) -> bool:
+        return self._stop_requested.is_set() or self.q.stop_requested(item["id"])
+
+    def run(self):
+        while not self._shutdown.is_set():
+            if not self._reconcile_pending():
+                self._wake.wait(timeout=5)
+                self._wake.clear()
+                continue
+            item = None
+            try:
+                self.q.reap_orphans()
+                # Claim and publish the current item under the same lock that
+                # stop_current reads. There must be no durable-running window
+                # in which `stop` can truthfully-but-wrongly say "nothing".
+                with self._process_lock:
+                    item = self.q.take()
+                    if item is not None and item.get("state") != "delivering":
+                        self._current_item = item
+            except QueuePersistenceError as e:
+                # A claim that was not durably recorded must never execute. Keep
+                # the thread alive so a transient disk problem can recover.
+                print("[slack] queue claim failed: %s" % e, file=sys.stderr)
+                self._wake.wait(timeout=5)
+                self._wake.clear()
+                continue
+            if item is None:
+                self._wake.wait(timeout=5)
+                self._wake.clear()
+                continue
+            if item.get("state") == "delivering":
+                self._deliver_safely(item)
+            else:
+                self._run_safely(item)
+
+    def _run_safely(self, item):
+        """Contain one bad task so the Slack connection cannot outlive its worker.
+
+        `_run_one` normally turns provider failures into an ordinary Slack answer.
+        This boundary is for bugs in the worker itself.  Their outcome is unknown,
+        so the item stays visible and requires an explicit retry rather than being
+        repeated behind the owner's back.
+        """
+        with self._process_lock:
+            self._current_item = item
+        try:
+            try:
+                completed = self._run_one(item)
+                if completed is not None:
+                    self._deliver_safely(completed)
+            except Exception as e:
+                print("[slack] task #%s crashed: %s: %s" %
+                      (item.get("id", "?"), type(e).__name__, e), file=sys.stderr)
+                live_guard = self._abort_current()
+                try:
+                    if live_guard:
+                        self.q.mark_orphaned(item["id"], live_guard)
+                    else:
+                        self.q.interrupt(item["id"])
+                except Exception as qe:
+                    print("[slack] could not persist interrupted task #%s: %s" %
+                          (item.get("id", "?"), qe), file=sys.stderr)
+                    self._defer_recovery(
+                        "orphan" if live_guard else "interrupt", item["id"], live_guard)
+                ch, th = item.get("channel", ""), item.get("thread", "")
+                ask = item.get("ask_ts", "")
+                react(self.token, ch, ask, SEEN, on=False)
+                react(self.token, ch, ask, FAILED)
+                # A reply addressed to another bot is itself a new ask. Do not
+                # turn an internal crash into a delegation loop; people get a ping.
+                back = ("<@%s> " % item["user"]
+                        if item.get("user") and not item.get("from_dog") else "")
+                say(self.token, ch,
+                    ("%s⚠️ I hit an internal worker error. I kept task #%d as interrupted "
+                     "instead of guessing whether it is safe to run twice. Say `retry %d` "
+                     "or `drop %d`." % (back, item["id"], item["id"], item["id"])),
+                    th, broadcast=True)
+        finally:
+            with self._process_lock:
+                guard, self._guard = self._guard, None
+                self.current = None
+                self._current_item = None
+                if guard is not None:
+                    try:
+                        guard.close()
+                    except OSError:
+                        pass
+            self._stop_requested.clear()
+
+    def _deliver_safely(self, item):
+        """Deliver a persisted result without ever rerunning the completed work."""
+        try:
+            self._deliver_one(item)
+        except Exception as e:
+            print("[slack] delivery for task #%s failed: %s: %s" %
+                  (item.get("id", "?"), type(e).__name__, e), file=sys.stderr)
+            try:
+                self.q.delivery_failed(item["id"])
+            except Exception as qe:
+                print("[slack] could not persist failed delivery #%s: %s" %
+                      (item.get("id", "?"), qe), file=sys.stderr)
+                self._defer_recovery("delivery", item["id"])
+
+    def _deliver_one(self, item):
+        ch, th, ask = item["channel"], item["thread"], item.get("ask_ts", "")
+        posted = say(self.token, ch, item.get("delivery_text") or "(no output)",
+                     th, broadcast=True)
+        react(self.token, ch, ask, SEEN, on=False)
+        react(self.token, ch, ask,
+              (DONE if item.get("delivery_ok") else FAILED) if posted else FAILED)
+        if posted:
+            self.q.finish(item["id"])
+        else:
+            # The run is complete. Keep its answer as an outbox item; retrying
+            # this state sends only that answer and cannot repeat tool effects.
+            self.q.delivery_failed(item["id"])
+
+    def _stop_task(self, item):
+        """Persist the outcome-unknown result of an explicit stop."""
+        ch, th, ask = item["channel"], item["thread"], item.get("ask_ts", "")
+        self.q.interrupt(item["id"])
+        react(self.token, ch, ask, SEEN, on=False)
+        react(self.token, ch, ask, FAILED)
+        back = ("<@%s> " % item["user"]
+                if item.get("user") and not item.get("from_dog") else "")
+        say(self.token, ch,
+            ("%sstopped; task #%d is interrupted because it may have made partial changes. "
+             "Say `retry %d` or `drop %d`." %
+             (back, item["id"], item["id"], item["id"])), th, broadcast=True)
+        return None
+
+    def _run_one(self, item):
+        ch, th = item["channel"], item["thread"]
+        ask = item.get("ask_ts", "")            # the message that asked — the state goes ON it
+        if self._should_stop(item):
+            return self._stop_task(item)
+        # `run` takes the task positionally, but the Slack body must not be a process argument. A
+        # private one-shot file plus the constant bootstrap below reconstructs that positional arg
+        # only inside slackexec, after the guarded process tree is durably owned.
+        # --print: the answer, and nothing else on stdout. --mode: the autonomy this dog was
+        # ANNOUNCED with, finally bounding what the run may do rather than only what it said.
+        # COLLIE_IDENTITY: its name, which until now reached the Slack tag and no further.
+        # --json, not --print: the answer arrives as a FIELD instead of as whatever landed on
+        # stdout, and the same object carries the session id, which is what lets the next ask in
+        # this thread continue the last one rather than meet a dog with no memory of it.
+        run_args = ["--json", "--mode",
+                    AUTONOMY_MODE.get(self.dog.get("autonomy", ""), "plan")]
+        if self.provider:
+            run_args += ["--provider", self.provider]
+        prior = thread_session(ch, th, dog=self.dog.get("name", ""))
+        if prior:
+            run_args += ["--resume", prior]
+        # Who else is in this channel, so the dog can answer the one who asked and hand work on to
+        # a packmate. Fetched per ask because the channel is per ask; cached, so this is one call
+        # in two minutes rather than one per task. An empty roster is survivable — see roster().
+        mates = roster(self.token, ch)
+        env = dict(os.environ,
+                   COLLIE_IDENTITY=identity_text(self.dog, roster_line(mates, self.me)))
+        if self._should_stop(item):
+            return self._stop_task(item)
+        task_path = ""
+        try:
+            task_path = _private_task_file(item["text"], self.q.path)
+            cmd = [sys.executable, "-c", _SLACK_TASK_BOOTSTRAP, task_path] + run_args
+            # windowless: the dog runs under pythonw, which has no console of its own, so Windows
+            # hands every child a brand new one. One black box per task, popping up over whatever
+            # the owner of the machine was doing.
+            from . import plat as _plat
+            guard_state = "%s.guard-%d-%d.json" % (
+                self.q.path, item["id"], time.time_ns())
+            guarded = [sys.executable, "-m", "harness.slackguard",
+                       "--state", guard_state, "--"] + cmd
+            with self._process_lock:
+                cancelled = self._should_stop(item)
+                if not cancelled:
+                    self.current = subprocess.Popen(
+                        guarded, cwd=self.cwd, env=env, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, encoding="utf-8", errors="replace", **_plat.no_window_kwargs())
+                    self._guard = self.current.stdin
+            if cancelled:
+                return self._stop_task(item)
+
+            # The guard cannot start the actual CLI until its PID is durable.
+            # If this write fails, finally closes stdin and the guard exits 75.
+            self.q.attach_process(item["id"], self.current.pid, guard_state)
+            with self._process_lock:
+                if self._should_stop(item):
+                    guard, self._guard = self._guard, None
+                    if guard is not None:
+                        guard.close()
+                else:
+                    self._guard.write("go\n")
+                    self._guard.flush()
+                # communicate() closes Popen.stdin automatically. Keep the
+                # actual pipe in self._guard so it remains open as a parent-life
+                # signal until the guarded process exits.
+                self.current.stdin = None
+            out, err = self.current.communicate()
+            rc = self.current.returncode
+            # A requested stop commonly makes the guard return the same 76 an
+            # unexpected signal uses. The durable target marker decides which
+            # meaning won; classify it before the generic abrupt-tree check.
+            if self._should_stop(item):
+                return self._stop_task(item)
+            if rc == GUARD_INTERRUPTED_EXIT:
+                raise RuntimeError(
+                    "the guarded execution tree ended abruptly; its effects are unknown")
+        except Exception as e:
+            if self.current is not None:
+                # Once the guard exists, an orchestration error has an unknown
+                # execution outcome. Let the outer boundary stop it and preserve
+                # an explicit recovery choice; never report it as a normal run.
+                raise
+            out, err, rc = "", str(e), -1
+        finally:
+            if task_path:
+                try:
+                    os.unlink(task_path)
+                except OSError:
+                    pass
+
+        stopped = self._should_stop(item)
+        if stopped:
+            return self._stop_task(item)
+
+        out, err = (out or "").strip(), (err or "").strip()
+        # The answer is a field now, so nothing else on either stream can be mistaken for it: a
+        # huggingface_hub warning and the run's own stats line used to ride into the channel as
+        # part of the reply, and the warning is what the person then asked about.
+        res = {}
+        valid_envelope = False
+        try:
+            parsed = json.loads(out) if out.startswith("{") else None
+            if isinstance(parsed, dict):
+                res = parsed
+                valid_envelope = True
+        except Exception:
+            res = {}
+        if not valid_envelope:
+            # The JSON envelope is the executor's completion record. A killed
+            # guard itself cannot translate its child's signal to 76, so an
+            # empty/malformed stream must also remain outcome-unknown rather
+            # than being posted and deleted as a completed provider failure.
+            raise RuntimeError(
+                "the guarded run exited without a valid completion envelope")
+        if res.get("session"):
+            # this thread continues that run — for THIS dog; a packmate in the same thread keeps
+            # its own, because a session is a conversation in a particular repository.
+            thread_session(ch, th, res["session"], dog=self.dog.get("name", ""))
+        answer = (res.get("answer") or "").strip()
+        why = (res.get("error") or "").strip()
+        if rc == 0 and answer:
+            out = answer
+        else:
+            # A failure still has to say why, and stderr is the only thing that does. The ⚠️ is the
+            # one piece of protocol a peer reads: a reply that failed is worth a packmate's turn,
+            # a reply that succeeded is not.
+            out = "⚠️ " + (why or answer or err or out or "the run failed with no output")
+        # Slack rejects a message over 40k; keeping the tail keeps the conclusion,
+        # which is the part anyone reads.
+        if len(out) > 3500:
+            out = "…(trimmed)…\n" + out[-3500:]
+        # Addressed to whoever asked — dog or person, the same way. For a dog it is the difference
+        # between an answer and no answer: it reads a channel only through its own mentions, so work
+        # it delegated would come back somewhere it cannot see. For a person it is the difference
+        # between an answer and one they find later: a run takes minutes, by which time they are in
+        # another window, and a thread reply is the notification easiest to miss on a phone. Only
+        # the outcome is addressed; "queued" and "on it" stay unmentioned, because being pinged
+        # three times for one ask is how a colleague becomes a nuisance.
+        back = "<@%s> " % item["user"] if item.get("user") else ""
+        # One message per ask now: the answer. No `queued`, no `on it`, no `#N done` — those were
+        # three messages narrating one fact, and the fact is on the ask as a reaction.
+        # ORDINARY TEXT, not a code fence. Slack does not render a mention inside ```, so an answer
+        # posted that way could never reach a packmate however correctly it was addressed — the
+        # asker's <@…> worked only because it sits outside the fence. The fence earned its place
+        # when the answer was raw CLI output with stats and warnings in it; --print made the answer
+        # prose, and prose in a fence loses its wrapping, its emphasis and its links as well.
+        # Whatever the model fences itself still renders as code.
+        delivery = "%s%s" % (back, keep_known_mentions(out, mates) or "(no output)")
+        completed = self.q.complete(item["id"], delivery, rc == 0)
+        if completed is None:
+            return self._stop_task(item)
+        return completed
+
+
+# ---------------------------------------------------------------------------
+# Socket Mode
+# ---------------------------------------------------------------------------
+
+MENTION_RE = re.compile(r"<@[UW][A-Z0-9]+>")
+
+
+def slack_event_key(payload: dict, event: dict) -> str:
+    """A stable source id across Socket Mode redelivery and process restart."""
+    event_id = str(payload.get("event_id") or "").strip()
+    if event_id:
+        return "event:" + event_id
+    # Older/test payloads may not carry event_id. A Slack message timestamp is
+    # stable even when the envelope carrying it is replaced during redelivery.
+    ch, ts = str(event.get("channel") or ""), str(event.get("ts") or "")
+    return _message_source_key(ch, ts)
+
+# ---------------------------------------------------------------------------
+# The pack, talking to itself
+# ---------------------------------------------------------------------------
+#
+# Every event carrying a `bot_id` used to be dropped, which made two dogs in one channel deaf to
+# each other: BigMac's `@rowan hello` reached rowan's app and went in the bin. The reason was real —
+# two bots answering each other's mentions is a loop that spends real money on every lap — but it
+# also ruled out the thing a pack is for.
+#
+# "A reply mentions nobody, so it cannot re-trigger anyone" was true of the code and false of the
+# job: being asked to @ another dog is the ordinary way work is handed on, and a dog that reports
+# back to the dog that asked has to mention it or the answer goes nowhere. So mentions between dogs
+# are the mechanism, and the loop has to be bounded by something that can tell a chain that is
+# GETTING SOMEWHERE from a pair of dogs bouncing.
+#
+# Repetition is what distinguishes them. A delegation walks new ground — rowan asks juno, juno asks
+# cap — and every step is an edge nobody has used in this thread. A loop re-walks one edge: rowan,
+# juno, rowan, juno. So the rule is per-edge and not per-message: any one dog may reach this dog
+# PACK_LAPS times in a thread, which leaves room for "here is the answer" and "thanks, one more
+# thing" and stops the third identical lap. PACK_HOPS is the backstop for a long chain that never
+# repeats an edge but has clearly stopped being useful.
+#
+# Both are per-thread, so a new thread starts clean: the bound is on one conversation going round,
+# never on a pair of dogs speaking again.
+#
+# One thing stays forbidden at any depth: answering yourself. That loop needs no second party.
+PACK_LAPS = 2                      # times one particular dog may reach this one, per thread
+PACK_HOPS = 8                      # dog-to-dog turns in a thread, however many dogs are involved
+
+
+def pack_gate(state: dict, thread: str, peer: str, source_id: str = "",
+              laps: int = PACK_LAPS, hops: int = PACK_HOPS) -> str:
+    """Record one dog turn, idempotently across Socket Mode redelivery."""
+    t = state.setdefault(thread, {"n": 0, "edges": {}, "sources": {}})
+    if len(state) > 500:                       # a process that runs for weeks cannot grow forever
+        state.pop(next(iter(state)), None)
+    sources = t.setdefault("sources", {})
+    if source_id and source_id in sources:
+        return sources[source_id]
+    t["n"] += 1
+    t["edges"][peer] = t["edges"].get(peer, 0) + 1
+    if t["edges"][peer] > laps:
+        result = ("we have been round this %d times in this thread — stopping before it becomes a "
+                  "loop. A person, or a new thread, starts it again." % laps)
+    elif t["n"] > hops:
+        result = ("that is %d hands-off in one thread — stopping here; whatever this was meant to "
+                  "reach, it is not reaching it." % hops)
+    else:
+        result = ""
+    if source_id:
+        sources[source_id] = result
+    return result
+
+
+def provider_hint() -> str:
+    """Name a provider that has a credential on THIS machine, or "" if none does.
+
+    "Pick one in the Settings panel" is advice a person can follow and still land on a provider
+    that cannot start: `anthropic` wants ANTHROPIC_API_KEY, and the machine that has a Claude
+    subscription instead has a token Claude Code minted, under a different provider name. The gap
+    between those two names is invisible until a dog refuses to run, so the refusal names the one
+    that would have worked.
+    """
+    try:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return "\n  This machine has ANTHROPIC_API_KEY — try: --provider anthropic"
+        from . import providers
+        if providers._read_oauth_token():
+            return ("\n  This machine has a Claude Code token, which is a different provider name"
+                    " than\n  `anthropic`: --provider anthropic-oauth")
+    except Exception:
+        pass
+    return ""
+
+
+def _open_socket_url(app_token: str) -> str:
+    r = api("apps.connections.open", app_token)
+    if not r.get("ok"):
+        raise RuntimeError(
+            "apps.connections.open failed: %s — is this an app-level token (xapp-…) "
+            "with connections:write, and is Socket Mode enabled on the app?" % r.get("error"))
+    return r["url"]
+
+
+def _refresh(name: str, entry: dict, config_token: str) -> int:
+    """Bring one already-provisioned dog up to the manifest setup would build TODAY.
+
+    Every member of a pack was created at some point in this file's history and keeps the manifest
+    of that day — scopes, display name and face are all fixed at creation and none of them follow
+    a later change. The first dog to need the roster scopes was brought up to date by hand over the
+    API, once, which is exactly the per-dog handwork this command exists to remove; and there is
+    never only one such dog. `--config-token` on a finished dog means this, for any of them.
+    """
+    app_id = entry.get("app_id", "")
+    print("bringing %s up to the current manifest (app %s)…" % (name, app_id))
+    want = app_manifest(name)
+    # A NARROW patch, not the whole manifest. Two things force that. apps.manifest.update replaces
+    # rather than patches, so everything we do not mention is deleted — and our manifest also states
+    # creation-time defaults (interactivity off, no app-home tab) which are right for a NEW app and
+    # are not ours to reimpose on one that has been running: both older dogs measured here had
+    # interactivity ON, for reasons this file does not know. So converge the four things collie
+    # actually needs to work — who it is, what it may do, and the two settings that make an @ arrive
+    # — and leave every other switch exactly as the app has it.
+    patch = {
+        "display_information": {"name": want["display_information"]["name"]},
+        "features": {"bot_user": {"display_name": want["features"]["bot_user"]["display_name"]}},
+        "oauth_config": {"scopes": {"bot": want["oauth_config"]["scopes"]["bot"]}},
+        "settings": {"socket_mode_enabled": want["settings"]["socket_mode_enabled"],
+                     "event_subscriptions": want["settings"]["event_subscriptions"]},
+    }
+    try:
+        live = export_app(config_token, app_id)
+        before = sorted((live.get("oauth_config") or {}).get("scopes", {}).get("bot") or [])
+        res = update_app(config_token, app_id, merge_manifest(live, patch))
+    except Exception as e:
+        print("  %s" % e, file=sys.stderr)
+        return 1
+    after = sorted(patch["oauth_config"]["scopes"]["bot"])
+    gained = [s for s in after if s not in before]
+    print("  manifest updated%s" % ("  (+%s)" % ", ".join(gained) if gained else ""))
+
+    face = ""
+    try:
+        from . import avatar
+        face = avatar.write(name)
+    except Exception as e:
+        print("  (could not draw an avatar: %s)" % e)
+    icon_err = set_icon(config_token, app_id, face)
+    print("  face on" if not icon_err else "  (icon unchanged — %s)" % icon_err)
+
+    if res.get("permissions_updated"):
+        print("\n  the SCOPES changed, so one reinstall is needed to grant them — Slack exposes no\n"
+              "  API for that, it is the install itself that authorizes:\n"
+              "    https://api.slack.com/apps/%s/install-on-team\n"
+              "  then hand the new bot token back:\n"
+              "    collie slack setup --name %s --bot-token xoxb-…" % (app_id, name))
+    else:
+        print("  no scope changed — nothing to reinstall, it is already live")
+    return 0
+
+
+def setup(argv=None) -> int:
+    """`collie slack setup` — give one more dog its own app, its own handle, its own tokens.
+
+    Run it again for the next dog. Nothing here is per-machine: the pack is keyed by name, so two
+    dogs can live on one laptop working different repositories, and a name can move to another
+    machine without Slack noticing.
+
+    What cannot be automated, and why it is only two clicks: installing an app to a workspace has
+    no API — the install IS the authorization, and Slack will not let a program grant itself one —
+    and neither does reading back the two tokens it produces. Everything before that (the app, its
+    scopes, Socket Mode, the event subscription) is one manifest call.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog="collie slack setup")
+    ap.add_argument("--name", default="", help="what to call this one (default: the next free kennel name)")
+    ap.add_argument("--config-token", default=os.environ.get("SLACK_CONFIG_TOKEN", ""),
+                    help="app-configuration token (xoxe.xoxp-…) from api.slack.com/apps")
+    ap.add_argument("--bot-token", default="", help="xoxb-… , if you already have it")
+    ap.add_argument("--app-token", default="", help="xapp-… , if you already have it")
+    ap.add_argument("--presence-url", default="",
+                    help="Collie Presence Worker base URL (saved for this dog)")
+    ap.add_argument("--presence-token", default="",
+                    help="per-dog Presence credential (saved beside the Slack tokens)")
+    ap.add_argument("--list", action="store_true", help="show the pack and stop")
+    a = ap.parse_args(argv)
+
+    dogs = load_kennel()
+    if a.list:
+        if not dogs:
+            print("(no dogs yet — `collie slack setup` gives you one)")
+            return 0
+        for n, d in sorted(dogs.items()):
+            ready = "ready" if (d.get("bot_token") and d.get("app_token")) else "needs its tokens"
+            stable = ((" · pack %s · dog %s" % (d["team_id"], d["bot_user_id"]))
+                      if d.get("team_id") and d.get("bot_user_id") else "")
+            print("  %-10s %-12s app %s%s" % (n, ready, d.get("app_id", "?"), stable))
+        return 0
+
+    name = a.name or next((k for k in KENNEL if k.lower() not in
+                           {d.lower() for d in dogs}), "Collie%d" % (len(dogs) + 1))
+    # Papers means BOTH tokens. Checking only the bot token turned the half-provisioned case into a
+    # dead end: a dog whose xoxb- was saved and whose xapp- came later — which is the order the two
+    # pages hand them over in — was told it "already has papers" and refused, while `--list` said in
+    # the same breath that it needs its tokens. The one command that could finish it was the one
+    # command that would not run.
+    have = dogs.get(name) or {}
+    entry = dict(have)
+    presence_changed = False
+    if a.presence_url:
+        entry["presence_url"] = a.presence_url.rstrip("/")
+        presence_changed = True
+    if a.presence_token:
+        entry["presence_token"] = a.presence_token
+        presence_changed = True
+    if have.get("bot_token") and have.get("app_token"):
+        # A finished dog is not a dead end: it is the one that goes STALE. Scopes, the display name
+        # and the face are all fixed at creation, so every dog provisioned before a change to the
+        # manifest keeps the old one forever — and the only fix was to reach for the API by hand,
+        # once per dog, which is exactly the per-dog handwork this command exists to remove. Given
+        # the credential that can, bring it up to today's manifest instead of refusing.
+        if presence_changed:
+            dogs[name] = entry
+            save_kennel(dogs)
+        if a.config_token and entry.get("app_id"):
+            return _refresh(name, entry, a.config_token)
+        if presence_changed:
+            print("%s presence credential saved; its launcher reads it from the private kennel."
+                  % name)
+            return 0
+        print("%s already has papers (app %s). Pick another name, run `collie slack --name %s`, "
+              "or pass --config-token to bring its app up to the current manifest (scopes, name "
+              "and face)." % (name, have.get("app_id", "?"), name))
+        return 1
+
+    # THIS dog's face, drawn BEFORE anything can fail, so there is something of its own to upload
+    # and something on disk if the rest of setup stops early. Derived from the name, so it is the
+    # same face on every machine and after any reinstall.
+    face = ""
+    try:
+        from . import avatar
+        face = avatar.write(name)
+        t = avatar.traits(name)
+        print("  %s: %s coat on a %s plate — %s" % (name, t["coat"], t["plate"], face))
+    except Exception as e:                               # never let a picture stop a setup
+        print("  (could not draw an avatar: %s)" % e)
+
+    if not entry.get("app_id"):
+        if not a.config_token:
+            print("collie slack setup: needs an app-configuration token.\n"
+                  "  Get one at https://api.slack.com/apps → 'Your App Configuration Tokens' →\n"
+                  "  Generate Token, then re-run with --config-token xoxe.xoxp-… (or set\n"
+                  "  SLACK_CONFIG_TOKEN). It is the one credential Slack has no API to mint, and\n"
+                  "  it expires in 12 hours — it is used here once and never stored.",
+                  file=sys.stderr)
+            return 2
+        print("creating the app for %s…" % name)
+        res = create_app(a.config_token, app_manifest(name))
+        entry["app_id"] = res.get("app_id", "")
+        entry["team_id"] = (res.get("credentials") or {}).get("team_id", "")
+        dogs[name] = entry
+        save_kennel(dogs)
+        print("  app %s created" % entry["app_id"])
+        # Now, while the config token is still in hand and before anyone has seen the app: an
+        # icon set later is a second visit to a settings page, which is the cost this command
+        # exists to remove. It uploads THIS dog's face rather than one picture shared by the
+        # pack — the whole point of the name is that the members are told apart.
+        icon_err = set_icon(a.config_token, entry["app_id"], face)
+        print("  face on" if not icon_err else "  (default icon — %s)" % icon_err)
+
+    app_id = entry.get("app_id", "")
+    install = "https://api.slack.com/apps/%s/install-on-team" % app_id
+    tokens_page = "https://api.slack.com/apps/%s/general" % app_id
+    entry["bot_token"] = a.bot_token or entry.get("bot_token", "")
+    entry["app_token"] = a.app_token or entry.get("app_token", "")
+
+    if not (entry["bot_token"] and entry["app_token"]):
+        print("\ntwo clicks left, and they are the two Slack does not expose:\n"
+              "  1. install %s to the workspace and Allow:\n     %s\n"
+              "     then copy the Bot User OAuth Token (xoxb-…) from OAuth & Permissions\n"
+              "  2. copy the app-level token (xapp-…), already generated by Socket Mode:\n     %s\n"
+              % (name, install, tokens_page))
+        asked = False
+        if sys.stdin and sys.stdin.isatty():
+            # isatty() can be true where stdin still reads EOF — a PowerShell child process, a
+            # harness, a CI shell. Falling through to the printed instructions is the right
+            # outcome; crashing with EOFError after having CREATED the app is not, because the
+            # next run then meets an app it does not know it already made.
+            try:
+                entry["bot_token"] = entry["bot_token"] or input("  paste xoxb-…: ").strip()
+                entry["app_token"] = entry["app_token"] or input("  paste xapp-…: ").strip()
+                asked = True
+            except (EOFError, KeyboardInterrupt):
+                print("\n  (no console to paste into — carrying on without it)")
+        if not asked and not (entry["bot_token"] and entry["app_token"]):
+            print("  then: collie slack setup --name %s --bot-token xoxb-… --app-token xapp-…" % name)
+            dogs[name] = entry
+            save_kennel(dogs)
+            return 3
+
+    for label, tok, want in (("bot", entry["bot_token"], "xoxb-"), ("app", entry["app_token"], "xapp-")):
+        if tok and not tok.startswith(want):
+            print("that %s token does not start with %s — check you copied the right box"
+                  % (label, want), file=sys.stderr)
+            return 1
+    dogs[name] = entry
+    save_kennel(dogs)
+
+    who = api("auth.test", entry["bot_token"])
+    if not who.get("ok"):
+        print("the bot token does not authenticate: %s" % who.get("error"), file=sys.stderr)
+        return 1
+    # Older kennel rows predate team_id. Presence is partitioned by Slack workspace, so learn the
+    # stable id while auth.test is already in flight rather than asking someone to copy it by hand.
+    identity_changed = False
+    if who.get("team_id") and entry.get("team_id") != who.get("team_id"):
+        entry["team_id"] = who["team_id"]
+        identity_changed = True
+    if who.get("user_id") and entry.get("bot_user_id") != who.get("user_id"):
+        entry["bot_user_id"] = who["user_id"]
+        identity_changed = True
+    if identity_changed:
+        dogs[name] = entry
+        save_kennel(dogs)
+    print("\n%s is ready — @%s in %s. Start it with:\n"
+          "  collie slack --name %s --channels <channel id> --allow <your Slack member id>\n"
+          "  (copy channel/member IDs from Slack; both lists are required host-access controls)"
+          % (name, who.get("user", name.lower()), who.get("team", "your workspace"), name))
+    if face:
+        # It IS uploaded above, by `apps.icon.set`. That method is in no published list — the
+        # manifest has no icon field, which is why this was written off as un-automatable — but
+        # Slack's own CLI uses it on deploy, and it works. Undocumented means it can go away, so
+        # the path is still printed: if the upload ever fails the fallback is a drag, not a hunt.
+        print("  its face: %s\n    (already uploaded; to redo it by hand: "
+              "https://api.slack.com/apps/%s/general → Display Information)" % (face, app_id))
+    return 0
+
+
+def _autostart_paths(name: str):
+    from . import wallpaper as wp
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "", name.lower()) or "collie"
+    boot = os.path.join(os.path.expanduser("~"), ".collie", "slack-%s.pyw" % slug)
+    vbs = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                       "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+                       "collie-slack-%s.vbs" % slug)
+    return wp, boot, vbs
+
+
+def _agent_label(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "", name.lower()) or "collie"
+    return "run.collie.slack.%s" % slug
+
+
+def _agent_path(name: str) -> str:
+    return os.path.expanduser("~/Library/LaunchAgents/%s.plist" % _agent_label(name))
+
+
+def _plist(label: str, argv: list, cwd: str, log: str) -> str:
+    """A LaunchAgent for one dog. Escaped, because a path can contain & and a name can contain '."""
+    from xml.sax.saxutils import escape
+    args = "".join("    <string>%s</string>\n" % escape(a) for a in argv)
+    # KeepAlive, because the point is a dog that is THERE: a crash, a dropped socket that outlives
+    # the reconnect loop, a laptop waking on a different network. ThrottleInterval is the other half
+    # — a dog that exits immediately (a token revoked, a provider gone) would otherwise respawn
+    # forever at launchd's 10s default, and 60 makes that visible in the log as a slow heartbeat
+    # rather than a spin.
+    return ("""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array>
+%s  </array>
+  <key>WorkingDirectory</key><string>%s</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
+</dict>
+</plist>
+""" % (escape(label), args, escape(cwd), escape(log), escape(log)))
+
+
+def _install_launch_agent(name: str, cwd: str, channels: str = "", provider: str = "",
+                          autonomy: str = "", presence_url: str = "", allow: str = "") -> int:
+    """The macOS half: a LaunchAgent, which is what a per-user background job is here.
+
+    No wrapper script, unlike Windows: launchd takes an argv and two log paths directly, so the
+    interpreter is this one (`sys.executable` — the venv the command was run from, not whatever
+    `python3` will mean at the next login) and there is one file to delete.
+    """
+    label, path = _agent_label(name), _agent_path(name)
+    log = os.path.expanduser("~/.collie/slack-%s.log" % _agent_label(name).rsplit(".", 1)[-1])
+    argv = [sys.executable, "-m", "harness.cli", "slack", "--name", name, "--cwd", cwd]
+    for flag, v in (("--channels", channels), ("--allow", allow), ("--provider", provider),
+                    ("--autonomy", autonomy), ("--presence-url", presence_url)):
+        if v:
+            argv += [flag, v]
+    # Announce on every start would post a greeting on every wake and every crash-restart. The
+    # channel it WORKS in is what matters and that is --channels; reporting in is for a person
+    # starting it by hand.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_plist(label, argv, cwd, log))
+
+    uid = os.getuid()
+    # bootout first: without it, re-running this leaves the OLD arguments running and the new plist
+    # loaded but inert, which reads as "the flag I just changed did nothing".
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, label)],
+                   capture_output=True, text=True)
+    r = subprocess.run(["launchctl", "bootstrap", "gui/%d" % uid, path],
+                       capture_output=True, text=True)
+    if r.returncode != 0:                       # older macOS, or a session launchctl cannot address
+        r = subprocess.run(["launchctl", "load", "-w", path], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("wrote %s but launchctl refused it: %s"
+              % (path, (r.stderr or r.stdout or "").strip()), file=sys.stderr)
+        return 1
+    print("%s will come back after a restart, and after a crash.\n"
+          "  agent : %s\n  log   : %s\n  remove: collie slack --uninstall-autostart --name %s"
+          % (name, path, log, name))
+    return 0
+
+
+def _uninstall_launch_agent(name: str) -> int:
+    label, path = _agent_label(name), _agent_path(name)
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), label)],
+                   capture_output=True, text=True)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            print("removed %s; %s will not start itself again." % (path, name))
+            return 0
+    except OSError as e:
+        print("could not remove %s: %s" % (path, e), file=sys.stderr)
+        return 1
+    print("no autostart was installed for %s." % name)
+    return 0
+
+
+def install_autostart(name: str, cwd: str, channels: str = "", provider: str = "",
+                      autonomy: str = "", presence_url: str = "", allow: str = "") -> int:
+    """Bring this dog back after a restart.
+
+    A dog started from a terminal dies with the terminal, which is how one sat silent through a
+    day's worth of @-mentions with nothing anywhere saying it had gone. Same mechanism the
+    wallpaper already uses — a generated .pyw plus a hidden .vbs in the Startup folder — rather than
+    a second invention: no hardcoded interpreter or repo path, and removable by deleting two files.
+
+    Per DOG, not per machine: the pack is keyed by name, and two dogs on one laptop want two
+    entries.
+    """
+    # Which OS this is comes from plat and nothing else. Asking sys.platform first looked harmless
+    # and made this function unstubbable: the suite fakes plat.is_windows to exercise the launcher
+    # on a Mac, and a darwin check ahead of it ignored the fake — so running the tests installed a
+    # real LaunchAgent for a dog that does not live here.
+    from . import plat
+    if not plat.is_windows():
+        if sys.platform == "darwin":
+            return _install_launch_agent(name, cwd, channels, provider, autonomy, presence_url,
+                                         allow)
+        print("collie slack --install-autostart has no Linux form yet "
+              "(a systemd --user unit is the shape it wants).", file=sys.stderr)
+        return 2
+    wp, boot, vbs = _autostart_paths(name)
+    log = os.path.join(os.path.expanduser("~"), ".collie", "slack.log")
+    argv = ["slack", "--name", name, "--cwd", cwd]
+    if channels:
+        argv += ["--channels", channels]
+    if allow:
+        argv += ["--allow", allow]
+    if provider:
+        argv += ["--provider", provider]
+    # Autonomy too, when it was stated. Every other flag the person typed is written into the
+    # launcher and this one was not, so a dog set to `main` came back after a reboot on whatever
+    # identity.json happened to hold — and if that file is ever lost or reset, on the default
+    # `branch` instead. Quieter than the setting it replaces, which is the wrong direction for the
+    # one knob whose entire purpose is that nobody discovers it by watching it get crossed.
+    if autonomy:
+        argv += ["--autonomy", autonomy]
+    # The endpoint is public configuration and may be written into a launcher. The bearer
+    # credential is deliberately NOT an argument: it stays in the private kennel, out of process
+    # listings, generated scripts and launchd plists.
+    if presence_url:
+        argv += ["--presence-url", presence_url]
+    with open(boot, "w", encoding="utf-8") as f:
+        # repr() every path: a username with an apostrophe closes a raw string early and the
+        # generated launcher dies with a SyntaxError, silently, at logon.
+        f.write("# auto-generated by `collie slack --install-autostart`.\n"
+                "import sys, os\n"
+                "sys.path.insert(0, %s)\n"
+                "sys.stdin = open(os.devnull, 'r')\n"
+                "f = open(%s, 'a', encoding='utf-8', buffering=1)\n"
+                "sys.stdout = sys.stderr = f\n"
+                "from harness.cli import main\n"
+                "sys.argv = ['collie'] + %r\n"
+                "sys.exit(main())\n" % (repr(wp._pkg_parent()), repr(log), argv))
+    os.makedirs(os.path.dirname(vbs), exist_ok=True)
+    with open(vbs, "w", encoding="utf-8") as f:
+        f.write("' collie slack (%s) - hidden logon autostart (auto-generated).\n"
+                "q = Chr(34)\n"
+                'CreateObject("WScript.Shell").Run q & "%s" & q & " " & q & "%s" & q, 0, False\n'
+                % (name, wp.pythonw(), boot))
+    print("%s will come back after a restart.\n  launcher: %s\n  startup : %s\n"
+          "  remove  : collie slack --uninstall-autostart --name %s" % (name, boot, vbs, name))
+    return 0
+
+
+def uninstall_autostart(name: str) -> int:
+    from . import plat
+    if not plat.is_windows() and sys.platform == "darwin":
+        return _uninstall_launch_agent(name)
+    _, boot, vbs = _autostart_paths(name)
+    gone = []
+    for p in (vbs, boot):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                gone.append(p)
+        except OSError as e:
+            print("could not remove %s: %s" % (p, e), file=sys.stderr)
+    print("removed %d file(s); %s will not start itself again." % (len(gone), name))
+    return 0
+
+
+def main(argv=None) -> int:
+    import argparse
+    if argv and argv[0] == "setup":
+        return setup(argv[1:])
+    # Before the parser is built, because argparse evaluates defaults at construction: this is what
+    # lands a Provider chosen in the Settings panel into the environment. Without it `--provider`
+    # defaulted to "" for ever, nothing was passed to the child, and `collie run` fell to its own
+    # `or "mock"` — so a dog answered every ask from canned fixtures. webapp._provider() already
+    # refuses to do that and says why; this path never got the same treatment.
+    try:
+        from . import settings as _settings
+        _settings.apply()
+    except Exception:
+        pass
+
+    ap = argparse.ArgumentParser(prog="collie slack")
+    ap.add_argument("--name", default="", help="name this collie answers to (kept)")
+    ap.add_argument("--autonomy", default="", choices=["", "propose", "branch", "main"])
+    ap.add_argument("--cwd", default=os.getcwd(), help="repository it works in")
+    ap.add_argument("--provider", default=os.environ.get("COLLIE_PROVIDER", ""))
+    ap.add_argument("--announce", default="", help="channel id to say hello in")
+    ap.add_argument("--channels", default=os.environ.get("COLLIE_SLACK_CHANNELS", ""),
+                    help="required comma-separated channel ids it will work in")
+    ap.add_argument("--allow", default=os.environ.get("COLLIE_SLACK_ALLOW", ""),
+                    help="required comma-separated Slack user ids that may task it")
+    ap.add_argument("--presence-url", default=os.environ.get("COLLIE_PRESENCE_URL", ""),
+                    help="Collie Presence Worker base URL (credential comes from setup/kennel)")
+    ap.add_argument("--install-autostart", action="store_true",
+                    help="bring this dog back after a restart (opt-in; writes two files)")
+    ap.add_argument("--uninstall-autostart", action="store_true",
+                    help="stop it coming back")
+    args = ap.parse_args(argv)
+
+    if args.uninstall_autostart:
+        return uninstall_autostart(args.name or "collie")
+    if args.install_autostart:
+        scoped_channels = (args.channels or args.announce).strip()
+        if not scoped_channels or not args.allow.strip():
+            print("collie slack: autostart requires explicit --channels and --allow lists.",
+                  file=sys.stderr)
+            return 2
+        return install_autostart(args.name or "collie", args.cwd, scoped_channels, args.provider,
+                                 args.autonomy or "propose", args.presence_url, args.allow)
+
+    # The kennel first, the environment second. A pack means several dogs with several pairs of
+    # tokens, and one pair of environment variables cannot hold them — but an env var still wins
+    # when it is set, because that is how you run a dog with credentials you keep somewhere else.
+    dogs = load_kennel()
+    kept = dogs.get(args.name) or (list(dogs.values())[0] if len(dogs) == 1 and not args.name else {})
+    app_token = os.environ.get("SLACK_APP_TOKEN", "") or kept.get("app_token", "")
+    bot_token = os.environ.get("SLACK_BOT_TOKEN", "") or kept.get("bot_token", "")
+    # Failing loudly here rather than connecting and going quiet: a bot that is
+    # silently not listening looks exactly like a bot with nothing to do.
+    missing = [n for n, v in (("SLACK_APP_TOKEN", app_token), ("SLACK_BOT_TOKEN", bot_token)) if not v]
+    if missing:
+        known = ", ".join(sorted(dogs)) or "none yet"
+        print("collie slack: missing %s.\n"
+              "  `collie slack setup` gives a dog its own app and fills these in for you.\n"
+              "  dogs on this machine: %s\n"
+              "  SLACK_APP_TOKEN is the app-level token (xapp-…) with connections:write.\n"
+              "  SLACK_BOT_TOKEN is the bot token (xoxb-…) with app_mentions:read and chat:write."
+              % (" and ".join(missing), known), file=sys.stderr)
+        return 2
+
+    # A dog with no provider is worse than no dog. `collie run` defaults to "mock", which answers
+    # from canned fixtures — and a fixture is indistinguishable from a model that has gone wrong, so
+    # the dog reports "#1 done" and hands over confident nonsense. It did exactly that, in a real
+    # channel, for every ask. mock stays reachable, but only by NAME.
+    if not args.provider:
+        print("collie slack: no provider.\n"
+              "  Looked at: --provider, then COLLIE_PROVIDER (which the Settings panel injects).\n"
+              "  A value in `collie config` is not necessarily a saved one — that listing falls\n"
+              "  back to defaults, so it can name a provider nothing has actually configured.%s\n"
+              "  Refusing rather than falling back to `mock`: mock answers from fixtures, and a\n"
+              "  fixture in a channel reads exactly like a model that has gone wrong.\n"
+              "  To do that on purpose: --provider mock"
+              % provider_hint(), file=sys.stderr)
+        return 2
+
+    # Where it will work at all. Defaulting to "only the channel I was announced
+    # in" rather than "anywhere I am invited": a bot dropped into another channel
+    # by a colleague would otherwise arrive already able to drive this machine,
+    # and nobody involved would think of that as granting access.
+    channels = {c.strip() for c in (args.channels or args.announce).split(",") if c.strip()}
+    allowed = {u.strip() for u in args.allow.split(",") if u.strip()}
+    if not channels or not allowed:
+        print("collie slack: refusing an unscoped listener.\n"
+              "  Set --channels C0123,... and --allow U0123,... explicitly.\n"
+              "  Slack access controls are a host-command boundary, so empty no longer means "
+              "everyone.", file=sys.stderr)
+        return 2
+
+    ident = load_identity(args.name, args.autonomy)
+    if not ident["name"]:
+        # Several dogs live here and none was named. The token lookup above refuses this too, but
+        # only when the tokens come from the kennel — with SLACK_*_TOKEN in the environment it gets
+        # through, and what starts is a dog with no name: it answers in the channel as nobody, and
+        # its queue and session memory are filed under nobody as well.
+        print("collie slack: %d dogs on this machine (%s) — say which one with --name."
+              % (len(load_kennel()), ", ".join(sorted(load_kennel())) or "none"), file=sys.stderr)
+        return 2
+
+    # Acquire before queue recovery. Without the OS-held lock, a second copy
+    # could mistake the first copy's live task for a crashed one and run it twice.
+    try:
+        instance_lock = SlackInstanceLock(ident["name"])
+    except RuntimeError as e:
+        print("[slack] %s" % e, file=sys.stderr)
+        return 1
+
+    # Into those channels, under its own steam. Not fatal when it fails: a private channel it was
+    # already invited to works perfectly, and a dog that refuses to start over a channel it can
+    # already hear would be trading a working pack for a tidy rule.
+    for ch in sorted(channels):
+        err = join(bot_token, ch, ident["name"])
+        if err:
+            print("[slack] %s: %s" % (ch, err), file=sys.stderr)
+        else:
+            print("[slack] in %s" % ch)
+
+    q = TaskQueue(ident["name"], recover_running=True)
+    worker = Worker(q, ident, bot_token, args.cwd, args.provider)
+    worker.start()
+
+    # A quiet Socket Mode connection may receive no application message for hours. A separate
+    # heartbeat therefore proves both the listener thread and its queue are still observable even
+    # when recv_message() is blocked waiting for Slack.
+    health_state = {"state": "starting", "error": ""}
+    def health_loop():
+        from .ops import heartbeat
+        while True:
+            heartbeat("slack:" + ident["name"], health_state["state"], {
+                "waiting": q.waiting(), "unresolved": q.unresolved(),
+                "dead_letters": q.dead_letter_count(), "worker_alive": worker.is_alive(),
+                "error": health_state["error"],
+            }, ttl=50)
+            time.sleep(20)
+    threading.Thread(target=health_loop, name="slack-health", daemon=True).start()
+
+    # What every message is signed with. Name for who, machine for where — the
+    # machine part is recomputed on each start, so moving the name to another
+    # laptop changes what the channel sees rather than quietly lying. It appears in the greeting
+    # and in `who` — the two places someone is asking where a dog lives — and no longer on every
+    # message, where Slack already shows who spoke.
+    who = ("*%s* on *%s* (%s · %s), working in `%s`\nautonomy: *%s* — %s\nscope: %s · %s" % (
+        ident["name"], machine_label(), ident["os"], fingerprint(), args.cwd,
+        ident["autonomy"], AUTONOMY.get(ident["autonomy"], "?"),
+        "%d channel(s)" % len(channels), "%d person(s)" % len(allowed)))
+    print(who.replace("*", ""))
+    if args.announce:
+        first = ident.pop("_fresh", False)
+        hello = who + ("\n_reporting in. I picked the name used by my queue, Slack app, and launcher._"
+                       if first else "\n_reporting in._")
+        say(bot_token, args.announce, hello)
+
+    # Who this dog is to Slack. Needed only since the pack can talk: "is this me" cannot be answered
+    # from the name, and answering your own mention is the one loop with no second party to tire of
+    # it. Failing to find out is not fatal — it costs the self-check, not the dog.
+    my_user = my_bot = ""
+    me = {}
+    try:
+        me = api("auth.test", bot_token)
+        if not me.get("ok"):
+            raise RuntimeError(me.get("error") or "Slack refused the bot token")
+        my_user, my_bot = me.get("user_id", ""), me.get("bot_id", "")
+    except Exception as e:
+        print("[slack] auth.test failed (%s) — self-mentions will not be filtered" % e, file=sys.stderr)
+
+    # Save stable Slack ids for future starts and for the one-time enrollment command. Older kennel
+    # rows did not have them; auth.test is already required here, so learning them costs no call.
+    # Presence may use stored ids for operator-facing enrollment instructions, but runtime identity
+    # is accepted only from this bot token's fresh auth.test. Falling back to a stale kennel id after
+    # a token swap could make one Slack app renew another dog's lease.
+    team_id = me.get("team_id", "")
+    bot_user_id = my_user
+    if kept and ((team_id and kept.get("team_id") != team_id) or
+                 (bot_user_id and kept.get("bot_user_id") != bot_user_id)):
+        saved = dict(kept)
+        if team_id:
+            saved["team_id"] = team_id
+        if bot_user_id:
+            saved["bot_user_id"] = bot_user_id
+        dogs[ident["name"]] = saved
+        save_kennel(dogs)
+        kept = saved
+
+    slack_ready = threading.Event()
+    presence = _start_presence(args.presence_url, kept, team_id, bot_user_id,
+                               slack_ready, worker)
+
+    pack: dict = {}                 # thread -> dog-to-dog turns taken in it
+    seen: set[str] = set()          # envelope ids, for Slack's redeliveries
+    seen_order: list[str] = []
+
+    while True:
+        try:
+            url = _open_socket_url(app_token)
+            ws = wsclient.WebSocketClient.connect(url)
+            health_state.update(state="connected", error="")
+            slack_ready.set()
+            if presence:
+                presence.heartbeat_now()
+            print("[slack] connected as %s" % ident["name"])
+        except Exception as e:
+            health_state.update(state="retrying", error="%s: %s" % (type(e).__name__, e))
+            print("[slack] connect failed: %s — retrying in 10s" % e, file=sys.stderr)
+            time.sleep(10)
+            continue
+
+        try:
+            while True:
+                msg = ws.recv_message()
+                if msg is None:
+                    break
+                op, data = msg if isinstance(msg, tuple) else (1, msg)
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8", "replace")
+                try:
+                    env = json.loads(data)
+                except Exception:
+                    continue
+
+                env_id = env.get("envelope_id")
+                def acknowledge(remember: bool = True):
+                    """Ack quickly, but only after a new task is durably queued."""
+                    if not env_id:
+                        return
+                    if remember and env_id not in seen:
+                        seen.add(env_id)
+                        seen_order.append(env_id)
+                        if len(seen_order) > 500:
+                            seen.discard(seen_order.pop(0))
+                    try:
+                        ws.send_text(json.dumps({"envelope_id": env_id}))
+                    except Exception:
+                        pass
+
+                if env_id and env_id in seen:
+                    acknowledge(remember=False)
+                    continue
+
+                if env.get("type") != "events_api":
+                    acknowledge()
+                    continue
+                payload = env.get("payload") or {}
+                event = payload.get("event") or {}
+                if event.get("type") != "app_mention":
+                    acknowledge()
+                    continue
+
+                # Strip only THIS dog's own mention. Everyone else's is the ask's ADDRESSING
+                # information, and removing it removed the only thing that can reach them:
+                # "@cornetto go ask @rowan about the branch" arrived as "go ask about the branch".
+                # So the remedy the dog itself proposes when it cannot find its packmates — tell me
+                # what they are called — did not work either, because the telling was deleted too.
+                # No my_user (auth.test failed) falls back to the old strip-everything: without an
+                # id of its own a dog cannot tell its mention from anyone else's.
+                _raw = event.get("text", "")
+                text = (re.sub(r"<@%s(\|[^>]*)?>" % re.escape(my_user), "", _raw) if my_user
+                        else MENTION_RE.sub("", _raw)).strip()
+                ch = event.get("channel", "")
+                th = event.get("thread_ts") or event.get("ts") or ""
+                user = event.get("user", "")
+                low = text.lower()
+                source_id = slack_event_key(payload, event)
+
+                # A task receipt outlives both the queue item and this process.
+                # ACK its redelivery, but never create a second local task id.
+                if q.is_duplicate(source_id, ch, event.get("ts", ""), th, user, text):
+                    acknowledge()
+                    continue
+
+                # Another dog may ask; this dog may not ask itself. Self-mention is the one loop
+                # with no bound — it re-triggers on its own reply and never needs a second party.
+                peer = event.get("bot_id", "")
+                if (peer and peer == my_bot) or (user and user == my_user):
+                    acknowledge()
+                    continue
+                if peer:
+                    stop = pack_gate(pack, th, peer, source_id=source_id)
+                    if stop:
+                        # Persist the refusal before ACK. Otherwise an ACK loss
+                        # plus listener restart clears the in-memory lap count,
+                        # and the exact event rejected as a loop can redeliver
+                        # as apparently fresh executable work.
+                        q.record_event(source_id, ch, event.get("ts", ""))
+                        acknowledge()
+                        # Said once, to the dog that asked, and then not again: silence is how a
+                        # bounded exchange looks identical to a broken one.
+                        if not pack[th].get("said"):
+                            pack[th]["said"] = True
+                            say(bot_token, ch, stop, th)
+                        continue
+
+                # Two gates, and they are checked before the text is read as
+                # anything. Out of scope is answered rather than ignored: a bot
+                # that goes silent reads as broken, and someone will debug it by
+                # inviting it somewhere else.
+                if channels and ch not in channels:
+                    acknowledge()
+                    say(bot_token, ch, "I only work in the channel I was set up in.", th)
+                    continue
+                if allowed and user not in allowed:
+                    acknowledge()
+                    say(bot_token, ch, "I take work from %s here." %
+                        ", ".join("<@%s>" % u for u in sorted(allowed)), th)
+                    continue
+
+                if low.startswith("rename "):
+                    # The display name is also the stable key for credentials,
+                    # queue, instance lock and autostart. Changing only identity
+                    # strands old work and lets a new listener bypass its guard.
+                    # Provisioning a new named dog is an explicit offline
+                    # migration, never a live chat-side mutation.
+                    reply = ("I did not rename this live dog: its name owns its Slack app, queue, "
+                             "lock, and launcher. Provision the new name with `collie slack setup "
+                             "--name <new-name>` and move work only after this queue is empty.")
+                    q.record_event(source_id, ch, event.get("ts", ""))
+                    acknowledge()
+                    say(bot_token, ch, reply, th)
+                elif low in ("who", "who?", "status"):
+                    reply = "%s\n%d waiting · %d unresolved" % (
+                        who, q.waiting(), q.unresolved())
+                    q.record_event(source_id, ch, event.get("ts", ""))
+                    acknowledge()
+                    say(bot_token, ch, reply, th)
+                elif low in ("queue", "q", "queue?"):
+                    reply = "```\n%s\n```" % q.listing()
+                    q.record_event(source_id, ch, event.get("ts", ""))
+                    acknowledge()
+                    say(bot_token, ch, reply, th)
+                elif low == "stop":
+                    # Latch cancellation before ACK. If the listener dies in
+                    # the tiny gap after this, closing its pipe is itself the
+                    # process-tree stop and recovery preserves `interrupted`.
+                    reply = worker.stop_current(
+                        source_id, ch, event.get("ts", ""))
+                    acknowledge()
+                    say(bot_token, ch, reply, th)
+                elif low.startswith("drop "):
+                    try:
+                        reply = q.drop(int(low.split()[1]), source_id=source_id,
+                                       channel=ch, ask_ts=event.get("ts", ""))
+                    except (ValueError, IndexError):
+                        reply = "say `drop <id>` — the ids are in `queue`"
+                        q.record_event(source_id, ch, event.get("ts", ""))
+                    # The queue mutation is durable before Slack is told the
+                    # command was accepted. A crash cannot resurrect a dropped
+                    # waiting task and execute it after restart.
+                    acknowledge()
+                    say(bot_token, ch, reply, th)
+                elif low.startswith("retry "):
+                    try:
+                        words = low.split()
+                        delivery_retry = len(words) == 3 and words[1] == "delivery"
+                        task_id = int(words[2] if delivery_retry else words[1])
+                        if len(words) != (3 if delivery_retry else 2):
+                            raise ValueError
+                        reply = q.retry(task_id, confirm_delivery=delivery_retry,
+                                        source_id=source_id, channel=ch,
+                                        ask_ts=event.get("ts", ""))
+                        worker.nudge()
+                    except (ValueError, IndexError):
+                        reply = ("say `retry <id>`, or `retry delivery <id>` "
+                                 "after checking the thread")
+                        q.record_event(source_id, ch, event.get("ts", ""))
+                    acknowledge()
+                    say(bot_token, ch, reply, th)
+                elif not text:
+                    q.record_event(source_id, ch, event.get("ts", ""))
+                    acknowledge()
+                    say(bot_token, ch, "%s here. Ask me something, or say `queue`." % ident["name"], th)
+                else:
+                    try:
+                        item = q.add(text, ch, th, user, from_dog=bool(peer),
+                                     ask_ts=event.get("ts", ""), source_id=source_id)
+                    except QueueFullError as e:
+                        # The source receipt and rejected payload were committed together, so this
+                        # event can be ACKed without either running it or losing evidence of it.
+                        acknowledge()
+                        say(bot_token, ch,
+                            "My queue is full. I did not run this ask; I saved it as dead letter "
+                            "#%d for review." % e.task_id, th)
+                        continue
+                    except QueuePersistenceError as e:
+                        print("[slack] could not queue ask: %s" % e, file=sys.stderr)
+                        say(bot_token, ch,
+                            "I could not save that task safely, so I did not start it.", th)
+                        continue
+                    # Durable enqueue precedes ACK: a crash can cause a retry,
+                    # but the source receipt turns that retry into a no-op.
+                    acknowledge()
+                    if item is None:
+                        continue
+                    # The ask's OWN ts, kept on the item so the worker can mark that message rather
+                    # than post a line under it. `queued #N` and `on it — #N` are gone: two messages
+                    # narrating one fact, in a channel people are trying to read.
+                    react(bot_token, ch, item["ask_ts"], SEEN)
+                    worker.nudge()          # after the ts is stored, or the worker can beat it there
+        except Exception as e:
+            health_state.update(state="retrying", error="%s: %s" % (type(e).__name__, e))
+            print("[slack] connection lost (%s) — reconnecting" % e, file=sys.stderr)
+        finally:
+            health_state.update(state="retrying", error=health_state.get("error") or
+                                "Socket Mode connection closed")
+            slack_ready.clear()
+            if presence:
+                presence.heartbeat_now()
+            try:
+                ws.close()
+            except Exception:
+                pass
+        time.sleep(2)

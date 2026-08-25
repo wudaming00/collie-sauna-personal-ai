@@ -1,0 +1,508 @@
+"""Confirm-token + deterministic executor + receipts — the irreversible-action seam.
+
+The verifier (verifier.py) decides whether an outcome happened; this module
+decides whether an irreversible action is ALLOWED to happen and then performs it
+WITHOUT a model in the loop. It is the §5.1/§5.2 spine of the delegate plan:
+
+  1. A gated action never executes in the step that proposes it. The proposing
+     step materializes the exact action (propose -> nonce) and stops; the run
+     exits needs_you. State lives on disk, so it survives the proposing process
+     dying (the whole reason the confirm boundary IS a step boundary).
+  2. A human approves the materialized record (confirm(nonce)) — approving a
+     concrete payload, not an English sentence.
+  3. A deterministic executor (execute()) runs the approved action verbatim,
+     runs the done-check, and writes a receipt. No model reasons here, so an
+     injected page cannot talk the executor into a different action.
+
+Six guarantees, each pinned by tests/test_actions.py:
+  - single-use     an approved nonce fires the side effect AT MOST once (no double-send)
+  - durable        propose/confirm survive process restart (on-disk SQLite)
+  - payload-bound  the args are hashed at propose; tampering before execute is refused
+  - TOCTOU-safe    if the world diverged from the approved snapshot, execute refuses
+  - fail-closed    an unconfirmed (merely proposed) nonce cannot execute
+  - evidenced      every execution writes a receipt carrying the done-check verdict
+
+The side effect and the done-check are INJECTED (side_effect_fn, donecheck_fn),
+so this layer is fully testable with a counter + a fixture and performs no real
+irreversible action itself.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+import stat
+import threading
+import time
+from dataclasses import dataclass, field
+
+from . import redact as _redact
+from . import plat
+from .verifier import FAILED, INCONCLUSIVE, Verdict
+
+
+def _load_or_create_key(keyfile: str) -> bytes:
+    """The action-integrity secret, held OUTSIDE the state DB (0600 file). A
+    DB-write attacker cannot forge a valid MAC without also reading this file, so
+    binding actions with HMAC(key, …) is real integrity, not the recomputable
+    plain-SHA256 it replaces. Generated once, persisted, reused across restarts."""
+    try:
+        with open(keyfile, "rb") as f:
+            k = f.read().strip()
+            if len(k) >= 32:
+                return k
+    except FileNotFoundError:
+        pass
+    d = os.path.dirname(keyfile)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    k = secrets.token_hex(32).encode()
+    # ATOMIC create (O_EXCL, not O_TRUNC): two processes cold-starting on the same
+    # state dir (e.g. the colliejobd daemon + a `collie jobs ask`) must converge on
+    # ONE key. O_TRUNC let both write divergent keys (last-writer-wins on disk while
+    # each kept its own in-memory key) — a reminder proposed under one key then
+    # failed its MAC under the other, silently never firing while verify said
+    # "parked". On FileExistsError, adopt the winner's persisted key.
+    try:
+        fd = plat.open_excl(keyfile)       # O_CREAT|O_EXCL|O_WRONLY (+O_NOFOLLOW on POSIX)
+    except FileExistsError:
+        for _ in range(100):               # winner may have created but not yet written
+            try:
+                with open(keyfile, "rb") as f:
+                    k2 = f.read().strip()
+                if len(k2) >= 32:
+                    return k2
+            except FileNotFoundError:
+                pass
+            time.sleep(0.01)
+        return k                            # last resort (never observed in practice)
+    try:
+        os.write(fd, k)
+    finally:
+        os.close(fd)
+    plat.chmod_private(keyfile)            # owner-only on POSIX; no-op on Windows (ACLs differ)
+    return k
+
+# action lifecycle
+PENDING = "pending"      # materialized, awaiting human confirm
+APPROVED = "approved"    # human confirmed; executor may run it once
+EXECUTING = "executing"  # claimed by the executor (single-use latch)
+EXECUTED = "executed"    # side effect fired; receipt written
+REFUSED = "refused"      # rejected by a guard (never fired)
+EXPIRED = "expired"      # TTL elapsed before confirm
+
+
+def _j(o) -> str:
+    return json.dumps(o or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _mac(key: bytes, capability: str, args: dict, leash_id: str = "", job_id: str = "",
+         risk: str = "", snapshot: dict = None) -> str:
+    """HMAC over the payload AND its authority-bearing fields (leash, job, risk,
+    snapshot). Tampering any of them after propose is caught at execute, and —
+    because the key lives outside the DB (see _load_or_create_key) — a DB-write
+    attacker cannot recompute a valid MAC. This is real integrity, replacing the
+    earlier recomputable plain digest."""
+    payload = "\x00".join([capability, _j(args), leash_id or "", job_id or "",
+                           risk or "", _j(snapshot)])
+    return hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+@dataclass
+class ActionRecord:
+    nonce: str
+    capability: str
+    args: dict
+    digest: str
+    risk: str
+    state: str
+    job_id: str = ""
+    leash_id: str = ""
+    snapshot: dict = field(default_factory=dict)
+    created_at: int = 0
+    expires_at: int = 0
+
+
+@dataclass
+class Receipt:
+    """The durable answer to: what did collie do, under which leash, who approved
+    it, and how was it verified. Written for every execute() attempt that fires
+    (or is refused after approval)."""
+    nonce: str
+    capability: str
+    approved: bool
+    verdict: str
+    verdict_reason: str
+    evidence: str = ""
+    args_redacted: str = ""
+    job_id: str = ""
+    leash_id: str = ""
+    fired: bool = False
+    created_at: int = 0
+
+
+class RefusedError(Exception):
+    """A guard rejected the action; the side effect did NOT fire."""
+
+
+class ActionStore:
+    def __init__(self, path: str = None):
+        path = path or os.path.expanduser("~/.collie/actions.db")
+        d = os.path.dirname(path)
+        if d:
+            created = not os.path.isdir(d)
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            # A caller may intentionally place a test/custom DB directly in a
+            # shared parent such as /tmp. Never chmod that existing parent.
+            configured = os.environ.get("COLLIE_STATE_DIR")
+            known_private = (os.path.basename(os.path.normpath(d)) == ".collie" or
+                             bool(configured) and
+                             os.path.realpath(d) == os.path.realpath(configured))
+            if created or known_private:
+                try:
+                    os.chmod(d, 0o700)
+                except OSError:
+                    pass
+        self._key = _load_or_create_key(path + ".key")
+        self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
+        plat.chmod_private(path)
+        self.db.row_factory = sqlite3.Row
+        # Mission workers may execute independent campaigns concurrently through
+        # one ActionStore.  RLock also lets execute() call get() while holding the
+        # transaction guard without deadlocking.
+        self._lock = threading.RLock()
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.OperationalError:
+            pass
+        self._init()
+
+    def _init(self):
+        c = self.db.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS pending_actions(
+            nonce TEXT PRIMARY KEY, job_id TEXT, capability TEXT, args_json TEXT,
+            digest TEXT, risk TEXT, leash_id TEXT, snapshot_json TEXT, state TEXT,
+            created_at INTEGER, expires_at INTEGER, decided_at INTEGER,
+            executed_at INTEGER, attempted_at INTEGER, auto INTEGER DEFAULT 0,
+            refuse_reason TEXT)""")
+        for col, decl in (("attempted_at", "INTEGER"), ("auto", "INTEGER DEFAULT 0")):
+            try:  # guarded migrations for a db created before these columns existed
+                c.execute("ALTER TABLE pending_actions ADD COLUMN %s %s" % (col, decl))
+            except sqlite3.OperationalError:
+                pass
+        c.execute("""CREATE TABLE IF NOT EXISTS receipts(
+            receipt_id INTEGER PRIMARY KEY AUTOINCREMENT, nonce TEXT, job_id TEXT,
+            capability TEXT, args_redacted TEXT, leash_id TEXT, approved INTEGER,
+            fired INTEGER, verdict TEXT, verdict_reason TEXT, evidence TEXT,
+            created_at INTEGER)""")
+        self.db.commit()
+
+    def host_context_binding(self, case: dict, leash: dict) -> str:
+        """Opaque, stable binding for host-only action context.
+
+        Mission case/leash data may contain low-entropy personal facts, so a
+        plain SHA-256 in the action DB would be guessable.  Bind it with the
+        private ActionStore key and a domain separator; only the digest is
+        persisted in the MAC-protected snapshot.
+        """
+        payload = _j({"case": case or {}, "leash": leash or {}}).encode("utf-8")
+        return hmac.new(
+            self._key, b"collie-action-host-context-v1\x00" + payload,
+            hashlib.sha256).hexdigest()
+
+    # ── propose: materialize the exact action, return a payload-bound nonce ──
+    def propose(self, capability: str, args: dict, risk: str = "irreversible",
+                job_id: str = "", leash_id: str = "", snapshot: dict = None,
+                ttl_s: int = 86400, auto: bool = False) -> str:
+        # auto=True marks a daemon-driven action (e.g. a scheduled reminder's
+        # note.append): it is executed by colliejobd at fire time, never by a human,
+        # so it MUST stay out of the confirm inbox — otherwise a person could click
+        # it and fire the reminder early.
+        nonce = secrets.token_hex(16)
+        now = int(time.time())
+        with self._lock:
+            self.db.execute(
+                """INSERT INTO pending_actions(nonce,job_id,capability,args_json,digest,
+                     risk,leash_id,snapshot_json,state,created_at,expires_at,
+                     decided_at,executed_at,attempted_at,auto,refuse_reason)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,'')""",
+                (nonce, job_id, capability, json.dumps(args or {}, ensure_ascii=False),
+                 _mac(self._key, capability, args, leash_id, job_id, risk, snapshot), risk, leash_id,
+                 json.dumps(snapshot or {}, ensure_ascii=False), PENDING,
+                 now, now + int(ttl_s), int(auto)))
+            self.db.commit()
+        return nonce
+
+    def _row(self, nonce):
+        cur = self.db.execute("SELECT * FROM pending_actions WHERE nonce=?", (nonce,))
+        return cur.fetchone()
+
+    def get(self, nonce) -> ActionRecord:
+        with self._lock:
+            r = self._row(nonce)
+        if not r:
+            return None
+        return ActionRecord(
+            nonce=r["nonce"], capability=r["capability"],
+            args=json.loads(r["args_json"] or "{}"), digest=r["digest"],
+            risk=r["risk"], state=r["state"], job_id=r["job_id"],
+            leash_id=r["leash_id"], snapshot=json.loads(r["snapshot_json"] or "{}"),
+            created_at=r["created_at"], expires_at=r["expires_at"])
+
+    # ── confirm: a human approves the concrete record (single transition) ──
+    def confirm(self, nonce) -> ActionRecord:
+        now = int(time.time())
+        with self._lock:
+            r = self._row(nonce)
+            if not r:
+                raise RefusedError("unknown nonce")
+            if r["state"] != PENDING:
+                raise RefusedError(f"not pending (state={r['state']})")
+            if r["expires_at"] and now > r["expires_at"]:
+                self.db.execute("UPDATE pending_actions SET state=?,decided_at=? WHERE nonce=? AND state=?",
+                                (EXPIRED, now, nonce, PENDING))
+                self.db.commit()
+                raise RefusedError("expired before confirm")
+            # ATOMIC CAS: only PENDING -> APPROVED. Without `AND state=PENDING` a
+            # stale WAL-snapshot read (two concurrent tickers) could blindly revive
+            # an already-EXECUTED nonce back to APPROVED and re-fire it — the
+            # single-use latch in execute() then claims the fresh APPROVED and the
+            # side effect runs TWICE (a reminder written twice). The CAS makes the
+            # losing ticker match 0 rows.
+            cur = self.db.execute(
+                "UPDATE pending_actions SET state=?,decided_at=? WHERE nonce=? AND state=?",
+                (APPROVED, now, nonce, PENDING))
+            self.db.commit()
+            if cur.rowcount != 1:
+                raise RefusedError("not pending (lost confirm race)")
+        return self.get(nonce)
+
+    def refuse(self, nonce, reason="cancelled") -> bool:
+        """Atomically prevent a not-yet-claimed action from ever firing.
+
+        PENDING and APPROVED are both still revocable. EXECUTING is deliberately
+        excluded: an already-started external side effect cannot honestly be
+        recalled, and its receipt remains the source of truth.
+        """
+        now = int(time.time())
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE pending_actions SET state=?,refuse_reason=?,decided_at=? "
+                "WHERE nonce=? AND state IN (?,?)",
+                (REFUSED, reason[:200], now, nonce, PENDING, APPROVED))
+            self.db.commit()
+        return cur.rowcount == 1
+
+    def refuse_for_job(self, job_id, reason="mission cancelled") -> int:
+        """Revoke every unclaimed action owned by a cancelled mission/job."""
+        now = int(time.time())
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE pending_actions SET state=?,refuse_reason=?,decided_at=? "
+                "WHERE job_id=? AND state IN (?,?)",
+                (REFUSED, reason[:200], now, job_id, PENDING, APPROVED))
+            self.db.commit()
+        return cur.rowcount
+
+    def retire_stale_reversible(self, nonce, *, min_age_s=600,
+                                reason="stale reversible execution retired") -> bool:
+        """Close an abandoned reversible EXECUTING latch with an honest receipt.
+
+        This is intentionally incapable of touching publish/send/commerce/destructive actions.
+        It exists for a process that died or timed out after claiming a read/compose/browse/code
+        action, leaving an ordinary failed Mission impossible to retry forever.  The caller must
+        separately prove the Mission has no live run/resource owner; age and capability checks here
+        are defense in depth.  We record ``fired=True`` because the runner did start, but the result
+        remains INCONCLUSIVE rather than inventing success or pretending it never ran.
+        """
+        safe = {"research", "compose", "browse", "observe", "code"}
+        now = int(time.time())
+        with self._lock:
+            row = self._row(nonce)
+            if not row or row["state"] != EXECUTING or row["capability"] not in safe:
+                return False
+            if str(row["risk"] or "").lower() in {
+                    "publish", "send", "commerce", "destructive", "irreversible"}:
+                return False
+            started = int(row["attempted_at"] or row["created_at"] or now)
+            if now - started < max(60, int(min_age_s)):
+                return False
+            record = ActionRecord(
+                nonce=row["nonce"], capability=row["capability"],
+                args=json.loads(row["args_json"] or "{}"), digest=row["digest"],
+                risk=row["risk"], state=row["state"], job_id=row["job_id"],
+                leash_id=row["leash_id"], snapshot=json.loads(row["snapshot_json"] or "{}"),
+                created_at=row["created_at"], expires_at=row["expires_at"])
+            verdict = Verdict(INCONCLUSIVE, str(reason or "stale reversible execution retired")[:200])
+            _rc, params = self._mk_receipt(
+                record, approved=True, fired=True, verdict=verdict)
+            self.db.execute("BEGIN IMMEDIATE")
+            cur = self.db.execute(
+                "UPDATE pending_actions SET state=?,executed_at=? "
+                "WHERE nonce=? AND state=?",
+                (EXECUTED, now, nonce, EXECUTING))
+            if cur.rowcount != 1:
+                self.db.rollback()
+                return False
+            self.db.execute(
+                """INSERT INTO receipts(nonce,job_id,capability,args_redacted,leash_id,
+                     approved,fired,verdict,verdict_reason,evidence,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""", params)
+            self.db.commit()
+        return True
+
+    # ── execute: the deterministic, model-free executor ──
+    def execute(self, nonce, side_effect_fn, donecheck_fn=None,
+                unchanged_fn=None, redact_fn=None) -> Receipt:
+        """Perform an APPROVED action exactly once, then verify + write a receipt.
+
+        side_effect_fn(record) -> anything   the real irreversible action
+        donecheck_fn(record, result) -> Verdict   post-action verification
+        unchanged_fn(record) -> bool         TOCTOU: True iff world still matches
+                                             the approved snapshot (else refuse)
+        redact_fn(args) -> str               redact args before they hit a receipt
+        """
+        now = int(time.time())
+        with self._lock:
+            r = self._row(nonce)
+            if not r:
+                raise RefusedError("unknown nonce")
+            # fail-closed: only an APPROVED action may execute (not pending/executed/…)
+            if r["state"] != APPROVED:
+                raise RefusedError(f"not approved for execution (state={r['state']})")
+            # payload binding: capability/args AND authority fields must be intact
+            args = json.loads(r["args_json"] or "{}")
+            expect = _mac(self._key, r["capability"], args, r["leash_id"], r["job_id"],
+                          r["risk"], json.loads(r["snapshot_json"] or "{}"))
+            if not hmac.compare_digest(expect, r["digest"] or ""):
+                self._refuse(nonce, "payload MAC mismatch (tampered)", now)
+                raise RefusedError("payload MAC mismatch (tampered)")
+            # single-use latch + durable attempt marker in ONE txn: atomically
+            # claim APPROVED -> EXECUTING and stamp attempted_at. A second
+            # concurrent/duplicate execute sees a non-APPROVED row and is refused,
+            # so the side effect can never fire twice (no double-send); attempted_at
+            # makes a crash-after-fire distinguishable from crash-before-fire.
+            claimed = self.db.execute(
+                "UPDATE pending_actions SET state=?,attempted_at=? WHERE nonce=? AND state=?",
+                (EXECUTING, now, nonce, APPROVED))
+            self.db.commit()
+            if claimed.rowcount != 1:
+                raise RefusedError("already claimed (single-use)")
+            record = self.get(nonce)
+
+        # TOCTOU: outside the lock (may do I/O). If the world diverged from what
+        # the human approved, refuse WITHOUT firing and roll the latch back to
+        # approved so a later re-check can proceed.
+        if unchanged_fn is not None:
+            try:
+                still = bool(unchanged_fn(record))
+            except Exception:
+                still = False
+            if not still:
+                with self._lock:
+                    self.db.execute("UPDATE pending_actions SET state=? WHERE nonce=?",
+                                    (APPROVED, nonce))
+                    self.db.commit()
+                self._write_receipt(record, approved=True, fired=False,
+                                    verdict=Verdict(INCONCLUSIVE,
+                                                    "world diverged from approved snapshot"),
+                                    redact_fn=redact_fn)
+                raise RefusedError("world diverged from approved snapshot (TOCTOU)")
+
+        # fire the real side effect exactly once. If the capability RAISES, that
+        # must become an honest FAILED receipt — never a traceback to the user or a
+        # nonce stuck in EXECUTING forever (which would dead-end the job). This one
+        # guard closes the entire "a capability bug crashes the run" class.
+        try:
+            result = side_effect_fn(record)
+            verdict = donecheck_fn(record, result) if donecheck_fn else \
+                Verdict(INCONCLUSIVE, "no done-check declared")
+        except Exception as e:
+            verdict = Verdict(FAILED, ("capability raised: %s: %s"
+                                       % (type(e).__name__, e))[:200])
+
+        # finalize: terminal state AND the evidenced receipt land in ONE commit,
+        # so a crash cannot leave a fired action EXECUTED without its receipt.
+        rc, params = self._mk_receipt(record, approved=True, fired=True,
+                                      verdict=verdict, redact_fn=redact_fn)
+        with self._lock:
+            self.db.execute("UPDATE pending_actions SET state=?,executed_at=? WHERE nonce=?",
+                            (EXECUTED, int(time.time()), nonce))
+            self.db.execute(
+                """INSERT INTO receipts(nonce,job_id,capability,args_redacted,leash_id,
+                     approved,fired,verdict,verdict_reason,evidence,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""", params)
+            self.db.commit()
+        return rc
+
+    # ── receipts ──
+    def _refuse(self, nonce, reason, now):
+        self.db.execute("UPDATE pending_actions SET state=?,refuse_reason=? WHERE nonce=?",
+                        (REFUSED, reason, nonce))
+        self.db.commit()
+
+    def _mk_receipt(self, record: ActionRecord, approved: bool, fired: bool,
+                    verdict: Verdict, redact_fn=None):
+        """Build the Receipt + its INSERT params. Redaction is on by DEFAULT: with
+        no redact_fn, args are scrubbed of pattern-matched secrets (tokens/keys)
+        via redact.py before they land in the receipts DB. This is defense-in-depth
+        — it does not catch non-pattern PII (e.g. a raw card number), so callers
+        handling such data should pass a stricter redact_fn."""
+        ev = "; ".join(getattr(o, "detail", str(o)) for o in (verdict.evidence or ()))
+        raw = json.dumps(record.args, ensure_ascii=False)
+        args_redacted = redact_fn(raw) if redact_fn else _redact.redact(raw, {})
+        rc = Receipt(nonce=record.nonce, capability=record.capability, approved=approved,
+                     verdict=verdict.status, verdict_reason=verdict.reason, evidence=ev,
+                     args_redacted=args_redacted, job_id=record.job_id,
+                     leash_id=record.leash_id, fired=fired, created_at=int(time.time()))
+        params = (rc.nonce, rc.job_id, rc.capability, rc.args_redacted, rc.leash_id,
+                  int(approved), int(fired), rc.verdict, rc.verdict_reason, rc.evidence,
+                  rc.created_at)
+        return rc, params
+
+    def _write_receipt(self, record: ActionRecord, approved: bool, fired: bool,
+                       verdict: Verdict, redact_fn=None) -> Receipt:
+        rc, params = self._mk_receipt(record, approved, fired, verdict, redact_fn)
+        with self._lock:
+            self.db.execute(
+                """INSERT INTO receipts(nonce,job_id,capability,args_redacted,leash_id,
+                     approved,fired,verdict,verdict_reason,evidence,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""", params)
+            self.db.commit()
+        return rc
+
+    def receipts(self, nonce=None):
+        q = "SELECT * FROM receipts"
+        args = ()
+        if nonce:
+            q += " WHERE nonce=?"
+            args = (nonce,)
+        with self._lock:
+            rows = self.db.execute(q + " ORDER BY receipt_id", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def pending(self):
+        """Actions awaiting a HUMAN confirm — the inbox. Excludes auto (daemon-
+        driven) actions like a scheduled reminder, which must never be human-fired."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM pending_actions WHERE state=? AND COALESCE(auto,0)=0 "
+                "ORDER BY created_at", (PENDING,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def list(self, state=None):
+        q, a = "SELECT * FROM pending_actions", ()
+        if state:
+            q, a = q + " WHERE state=?", (state,)
+        with self._lock:
+            rows = self.db.execute(q + " ORDER BY created_at", a).fetchall()
+        return [dict(r) for r in rows]
+
+    def close(self):
+        with self._lock:
+            self.db.close()

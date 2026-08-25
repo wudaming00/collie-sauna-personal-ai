@@ -1,0 +1,396 @@
+name: Release
+
+# Cut a release by pushing a version tag that matches harness/__init__.py:
+#   git tag v0.19.0 && git push origin v0.19.0
+# Produces a GitHub Release with the Windows one-click installer (Collie-Setup.exe), the macOS disk
+# image (arm64), VS Code extension, and the Python wheel + sdist attached.
+#
+# The macOS job signs and notarises only if these repository secrets are set; without them it still
+# builds, and says plainly that the result is not shippable:
+#   MACOS_CERT_P12       base64 of a Developer ID Application .p12  (see installer/DEVELOPER_ID.md)
+#   MACOS_CERT_PASSWORD  the password used when exporting that .p12
+#   ASC_KEY_P8           base64 of the App Store Connect API key (.p8)
+#   ASC_KEY_ID           its key id
+#   ASC_ISSUER_ID        the issuer UUID
+#
+# No PyPI publish (yet). GITHUB_TOKEN is enough to create the release; when you're ready for PyPI,
+# add a publish job using Trusted Publishing (OIDC, no token).
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual dry run. The signing chain has a lot of ways to look fine and not be — an unsigned dmg
+  # notarises and staples happily, and a secret that is set but unreadable makes the build fall back
+  # to unsigned in silence. Being able to exercise it WITHOUT cutting a release is what lets you find
+  # that out before a release depends on it. Nothing is published on this path.
+  workflow_dispatch:
+
+permissions:
+  contents: write        # create the GitHub Release and upload assets
+
+jobs:
+  # The tag and the in-code version must agree, or downstream users get a v0.19.0 release that
+  # installs 0.18.0. Fail loudly before building anything.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Tag matches harness.__version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CODE=$(python -c "import harness; print(harness.__version__)")
+          echo "tag=$TAG  code=$CODE"
+          test "$TAG" = "$CODE" || { echo "::error::tag v$TAG != harness.__version__ $CODE"; exit 1; }
+
+  # A tag can point at a commit that never travelled through main or a pull request. Run the same
+  # complete gate here on all supported desktop platforms and make every release artifact depend on
+  # the whole matrix, so version agreement alone can never publish an untested build.
+  quality-gate:
+    name: quality gate (${{ matrix.os }} / Python ${{ matrix.python }})
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: macos-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.12" }
+    defaults:
+      run:
+        # Git Bash is preinstalled on windows-latest; one shell keeps run_all.sh identical on all OSes.
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      COLLIE_PROVIDER: mock
+      COLLIE_EMBED: bm25
+      PYTHONUNBUFFERED: "1"
+      HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[browser,tui,acp,search,remote,dev]"
+      - name: Install Playwright Chromium
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            python -m playwright install --with-deps chromium
+          else
+            python -m playwright install chromium
+          fi
+      - run: bash tests/run_all.sh
+
+  wheel:
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build                       # dist/*.whl + dist/*.tar.gz (version is dynamic)
+      - name: Smoke install the built wheel outside the checkout
+        run: |
+          python -m venv "$RUNNER_TEMP/collie-wheel-smoke"
+          SMOKE_PY="$RUNNER_TEMP/collie-wheel-smoke/bin/python"
+          "$SMOKE_PY" -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$SMOKE_PY" -I - <<'PY'
+          from importlib import metadata, resources
+          import harness
+
+          installed = metadata.version("collie-harness")
+          if installed != harness.__version__:
+              raise SystemExit(
+                  "wheel version mismatch: metadata=%s code=%s" %
+                  (installed, harness.__version__))
+          webui = resources.files("harness").joinpath("webui")
+          for name in ("index.html", "mobile.html", "remote.html"):
+              if not webui.joinpath(name).is_file():
+                  raise SystemExit("wheel is missing harness/webui/%s" % name)
+          print("installed wheel smoke OK:", installed)
+          PY
+          "$RUNNER_TEMP/collie-wheel-smoke/bin/collie" --version
+      - name: Verify wheel excludes retired OAuth proxy assets
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              raise SystemExit("expected exactly one release wheel")
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = set(archive.namelist())
+          required = {
+              "harness/claude_agent_sdk.py",
+              "harness/claude_agent_worker.py",
+          }
+          missing = sorted(required - names)
+          retired = sorted(
+              name for name in names
+              if "oauth_proxy" in name or "/oauth_ext/" in name
+          )
+          if missing or retired:
+              raise SystemExit(
+                  "wheel content rejected: missing=%r retired=%r" %
+                  (missing, retired))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  installer:
+    needs: quality-gate
+    # GitHub-hosted, because the hosted runner demonstrably works for this job and no `collie-win`
+    # runner exists to move it to. The Windows box has exactly one runner registered and it belongs
+    # to wudaming00/vocalcode with the label `vocalcode-win`, so a job asking for `collie-win` waits
+    # for a machine that is never going to appear.
+    #
+    # Correcting the record this reverts (a7761d3): "0.20.18, 0.20.19 and 0.20.20 each got a tag and
+    # none of them produced anything" is not what happened. Every Release run from v0.20.16 to
+    # v0.20.20 completed successfully on hosted runners and published four assets each — the
+    # v0.20.20 run finished at 08:07:33Z, four minutes BEFORE that commit was authored, and its
+    # Collie-Setup.exe was downloaded and verified. Hosted minutes are not gone.
+    #
+    runs-on: windows-latest
+    # Overrides the workflow-level `contents: write`: this job only reads the repo and uploads an
+    # artifact, and id-token is what lets it exchange a GitHub OIDC token for an Azure one.
+    permissions:
+      contents: read
+      id-token: write
+    # Required, not cosmetic. The Azure federated credential is bound to
+    # `repo:colliehq/collie:environment:release`, because tag names differ every release and the
+    # subject claim accepts no wildcard — so without this line the token exchange is refused.
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # No tool-cache override here. This job runs on a GitHub-HOSTED Windows runner, where the
+      # default cache is the only one setup-python's package knows how to install into; pointing
+      # it at a self-hosted path (a fix aimed at the macOS jobs, applied to all three) made the
+      # install script fail with "Error happened during Python installation" and cost v0.20.22
+      # its release.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Inno Setup 6
+        run: choco install innosetup --no-progress -y
+      - name: Generator deps (Pillow for the wizard art)
+        run: python -m pip install --upgrade pillow
+      - name: Build Collie-Setup.exe (branded Inno installer)
+        # build.ps1 = art -> language data -> embeddable-python payload -> iscc, producing the
+        # Collie-branded Inno wizard (modern style, custom icon, wizard art at every DPI) directly as
+        # installer/Output/Collie-Setup.exe.
+        #
+        # We ship the plain Inno installer, NOT the WebView2 self-extracting "smart shell": that
+        # self-extractor pattern is a magnet for antivirus false positives (Chrome/Defender flagged the
+        # unsigned Collie-Setup.exe as a virus and blocked the download). A standard Inno installer is
+        # ubiquitous and rarely flagged, and it supports /SILENT natively (so `collie update` works
+        # without the shell launcher's arg-forwarding). To bring the dark shell UI back, sign the build
+        # (see docs/signing.md) and switch this step back to installer/shell/pack.ps1.
+        shell: pwsh
+        run: ./installer/build.ps1
+
+      # ── Code signing ────────────────────────────────────────────────────────────────────
+      # Unsigned, Chrome and Defender flagged Collie-Setup.exe as a virus and blocked the
+      # download outright (see the note above) — that is what this fixes. Signed by Azure
+      # Artifact Signing as CN=Daming Wu, chaining to the Microsoft Identity Verification Root,
+      # so the publisher is trusted out of the box. The same certificate signs VocalCode; one
+      # identity, one subscription.
+      #
+      # Auth is OIDC, deliberately: no long-lived credential is stored anywhere. GitHub mints a
+      # short-lived token for this job, Azure trades it for an access token, and the service
+      # principal behind it can do exactly one thing — sign with this certificate profile. The
+      # client and tenant ids below are identifiers, NOT secrets: they are useless without a
+      # GitHub-issued token for this repo and environment, which is why they can sit in a public
+      # workflow file. A stored client secret in a public repo would be the real hazard, since
+      # leaking it would let someone sign arbitrary code as this person.
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: 62282756-278c-40b0-87cf-0ce4a3aebeb5
+          tenant-id: cb753fb0-36e6-47cb-a8ed-9c60cc644d12
+          subscription-id: bbbe77f4-5a52-4091-b06e-d9d74e1cb381
+
+      - name: Sign Collie-Setup.exe
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: vocalcode-signing
+          certificate-profile-name: public-trust
+          files-folder: installer/Output
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Not decoration: the signing step can report success while leaving a file unsigned (that
+      # is how the macOS chain used to fool us), and an unsigned release is the whole problem we
+      # are here to fix. Fail the build rather than publish one.
+      - name: Verify the installer really is signed
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature -LiteralPath installer/Output/Collie-Setup.exe
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Collie-Setup.exe Authenticode status is $($signature.Status), not Valid"
+          }
+          $publisher = $signature.SignerCertificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          if ($publisher -cne "Daming Wu") {
+            throw "Collie-Setup.exe publisher is '$publisher', expected exact CN 'Daming Wu'"
+          }
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $st) { throw "signtool not found on the runner" }
+          & $st.FullName verify /pa /v installer/Output/Collie-Setup.exe
+          if ($LASTEXITCODE -ne 0) { throw "Collie-Setup.exe is NOT validly signed" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installer
+          path: installer/Output/Collie-Setup.exe
+
+
+  # macOS: the counterpart of the `installer` job. arm64 only, deliberately — see installer/README.md.
+  # One dmg means one download link and no "which Mac do I have?" put to the user; macOS 26 Tahoe is
+  # the last release that runs on Intel, and Intel Macs stopped shipping in 2023. (The Intel runner
+  # pool is also deeply queued, so a matrix would have made every release wait on a machine nobody is
+  # building for.)
+  #
+  # Signing is conditional, not assumed. Without the secrets this still produces an ad-hoc dmg (useful
+  # for testing the build itself), and build_mac.sh refuses to pretend it is shippable: it asks
+  # Gatekeeper for a verdict and exits non-zero if a notarised build is still refused.
+  dmg:
+    needs: quality-gate
+    # GitHub-hosted. Signing reads a Developer ID out of repository secrets rather than out of one
+    # laptop's login keychain — which is the only thing a self-hosted runner bought, and it cost
+    # every release waiting on that laptop being awake. v0.20.21 waited forever: its jobs asked for
+    # `collie-mac`, and no such runner was attached to the repo releases are cut from. A public
+    # repo is also the one place GitHub says not to put a self-hosted runner.
+    runs-on: macos-14        # Apple Silicon
+    # A step's own `env:` block is NOT in scope for that step's `if:`, so testing the secret there
+    # would evaluate to false forever and the build would quietly ship unsigned. Job-level env can
+    # read `secrets`, and step-level `if` can read job-level env.
+    env:
+      HAVE_CERT: ${{ secrets.MACOS_CERT_P12 != '' }}
+      HAVE_ASC: ${{ secrets.ASC_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: A real app icon
+        run: brew install librsvg          # the build falls back to Chrome, but this is faster
+
+      # The certificate lives in a throwaway keychain, not the login one: a runner has no login
+      # keychain to speak of, and a dedicated one is deleted with the VM either way.
+      - name: Import the Developer ID certificate
+        if: env.HAVE_CERT == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          PASS="$(uuidgen)"
+          security create-keychain -p "$PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASS" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+                          -T /usr/bin/codesign -T /usr/bin/security
+          # without this every codesign call blocks on a GUI prompt no one can answer
+          security set-key-partition-list -S apple-tool:,apple: -k "$PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning | grep "Developer ID Application"
+
+      - name: Notarisation credentials
+        if: env.HAVE_ASC == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          echo "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          xcrun notarytool store-credentials collie --key "$RUNNER_TEMP/asc.p8" \
+                --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
+          rm -f "$RUNNER_TEMP/asc.p8"
+
+      - name: Build Collie-arm64.dmg
+        run: |
+          set -euo pipefail
+          # Decided by what this hosted runner can actually do after importing the
+          # release secrets, rather than by trusting that a non-empty secret was usable.
+          args=(--bundle-python --dmg --arch arm64)
+          CAN_SIGN=no; CAN_NOTARISE=no
+          if security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
+            args+=(--sign); CAN_SIGN=yes
+          fi
+          if xcrun notarytool history --keychain-profile collie >/dev/null 2>&1; then
+            args+=(--notarize collie); CAN_NOTARISE=yes
+          fi
+          echo "sign=$CAN_SIGN notarise=$CAN_NOTARISE"
+
+          # A tag is a release people download. An unsigned dmg is stopped by
+          # Gatekeeper with "cannot be opened", so shipping one is worse than not
+          # shipping: it looks like the app is broken. Manual runs may go
+          # unsigned — that is what they are for.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && { [ "$CAN_SIGN" != "yes" ] || [ "$CAN_NOTARISE" != "yes" ]; }; then
+            echo "::error::refusing to cut a release with an unsigned or un-notarised dmg (sign=$CAN_SIGN notarise=$CAN_NOTARISE)"
+            exit 1
+          fi
+          bash installer/build_mac.sh "${args[@]}"
+          mv installer/Output/Collie-*.dmg installer/Output/Collie-arm64.dmg
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-dmg-arm64
+          path: installer/Output/Collie-arm64.dmg
+
+  vscode:
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Package the VS Code extension
+        working-directory: vscode-collie
+        run: npx --yes @vscode/vsce package --out ../Collie-VSCode.vsix
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vscode-extension
+          path: Collie-VSCode.vsix
+
+  release:
+    needs: [wheel, installer, dmg, vscode]
+    if: startsWith(github.ref, 'refs/tags/v')     # a manual dispatch builds and verifies, and stops there
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: Collie ${{ github.ref_name }}
+          generate_release_notes: true            # auto-changelog from merged PRs since the last tag
+          files: |
+            artifacts/windows-installer/Collie-Setup.exe
+            artifacts/macos-dmg-arm64/*.dmg
+            artifacts/vscode-extension/Collie-VSCode.vsix
+            artifacts/python-dist/*

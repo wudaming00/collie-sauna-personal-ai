@@ -1,0 +1,162 @@
+"""Several agents on one task must not write into each other.
+
+The bug this pins was measured, not imagined: two harnesses built the way run_pack builds them,
+run in sequence, and the second one's system prompt arrived carrying
+`RELEVANT MEMORY (auto-recalled): - Task 'pack0' -> <the first one's answer>`.
+Best-of-N selection is meaningless if attempt k has already read attempts 0..k-1.
+"""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from harness import cli
+from harness.memory import SqliteMemory
+from harness.loop import Harness
+from harness.providers import Completion, ModelProvider, Usage
+from harness.recorder import RunResult
+from harness.scratch import ScratchMemory, isolate_harness
+
+
+class StubProvider(ModelProvider):
+    """Answers in one turn. NOT named "mock" — the loop deliberately never consolidates mock runs,
+    which would hide the very write path under test."""
+    name = "stub"
+    model = "stub-1"
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.systems = []
+
+    def complete(self, system, messages, tool_schemas, on_text=None):
+        self.systems.append(system)
+        return Completion(text=self.answer, usage=Usage(input_tokens=10, output_tokens=10),
+                          stop_reason="end_turn")
+
+
+def test_scratch_writes_never_reach_the_shared_store():
+    with tempfile.TemporaryDirectory() as root:
+        base = SqliteMemory(os.path.join(root, "memory.db"))
+        before = base.count()
+        mem = ScratchMemory(base, read_project="repo")
+        mem.remember("a note only this agent should have", keys="note", project="agent-3")
+        assert mem.recall("note only this agent", project="agent-3"), "the agent can read it back"
+        assert base.count() == before, "nothing was written to the shared store"
+        assert not base.recall("note only this agent", project="repo")
+        assert not base.recall("note only this agent", project="agent-3")
+        mem.close()
+
+
+def test_scratch_reads_still_see_the_shared_baseline():
+    """Isolation must not mean starting dumb: every agent keeps the team's common knowledge."""
+    with tempfile.TemporaryDirectory() as root:
+        base = SqliteMemory(os.path.join(root, "memory.db"))
+        base.remember("the widget cache is invalidated in cache_util.py", project="repo")
+        # The agent is given its OWN project (that is what isolates its undo stack) and must still
+        # see the shared fact despite asking under that name.
+        mem = ScratchMemory(base, read_project="repo")
+        hits = mem.recall("where is the widget cache invalidated", project="agent-3")
+        assert any("cache_util.py" in h.get("text", "") for h in hits), hits
+        mem.close()
+
+
+def test_scratch_recall_forwards_device_boundary_before_pack_prompt():
+    with tempfile.TemporaryDirectory() as root:
+        base = SqliteMemory(os.path.join(root, "memory.db"))
+        base.remember("pack shared baseline", project="repo")
+        base.remember("pack local device note", project="repo", device_id="device-a")
+        base.remember("pack FOREIGN device note", project="repo", device_id="device-b")
+        mem = ScratchMemory(base, read_project="repo")
+
+        hits = mem.recall(
+            "pack device note baseline", project="packrun-0", device_id="device-a")
+
+        text = "\n".join(hit["text"] for hit in hits)
+        assert "shared baseline" in text and "local device note" in text
+        assert "FOREIGN" not in text
+        mem.close()
+
+
+def test_scratch_claim_lifecycle_never_reaches_the_shared_store():
+    """New proposal/review APIs must not fall through __getattr__ to the base DB."""
+    with tempfile.TemporaryDirectory() as root:
+        base = SqliteMemory(os.path.join(root, "memory.db"))
+        before = base.count()
+        mem = ScratchMemory(base, read_project="repo")
+
+        rid = mem.propose("candidate-only deployment conclusion", project="agent-3",
+                          source="agent_tool")
+        assert mem.get_claim(rid)["status"] == "proposed"
+        assert mem.list_claims("proposed", "agent-3")[0]["id"] == rid
+        assert base.count() == before
+        assert not base.list_claims(status="proposed")
+
+        assert mem.promote(rid, status="verified", evidence="candidate-local check")
+        assert mem.recall("deployment conclusion", project="agent-3")
+        assert not base.recall("deployment conclusion", project="repo")
+        assert base.count() == before
+
+        rejected = mem.propose("another candidate-only assertion", project="agent-3")
+        assert mem.reject(rejected, evidence="losing candidate")
+        assert mem.get_claim(rejected)["status"] == "rejected"
+        assert not base.list_claims(status="rejected")
+        mem.close()
+
+
+def test_scratch_run_claims_settle_inside_the_logical_project_boundary():
+    with tempfile.TemporaryDirectory() as root:
+        base = SqliteMemory(os.path.join(root, "memory.db"))
+        mem = ScratchMemory(base, read_project="repo")
+        producer = {"run_id": 41, "task_id": "learn", "provider": "stub",
+                    "model": "stub-1"}
+        claim_id = mem.propose(
+            "candidate-local verified conclusion", project="agent-3",
+            source="run_consolidation", provenance=producer)
+        harness = object.__new__(Harness)
+        harness.memory = mem
+        harness.project = "agent-3"
+        result = RunResult(
+            run_id=41, task_id="learn", provider="stub", model="stub-1",
+            memory_claim_ids=[claim_id])
+
+        assert harness.settle_run_memory(result, True) == {
+            "promoted": 1, "rejected": 0}
+        assert mem.get_claim(claim_id)["status"] == "verified"
+        assert base.count() == 0
+        mem.close()
+
+
+def test_two_agents_on_one_task_do_not_see_each_other(monkeypatch):
+    with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as cwd:
+        monkeypatch.setattr(cli, "DATA", data)
+        shared = SqliteMemory(cli._paths()[0])
+        # Keep the shared fact relevant under the supported BM25-only fallback too. Isolation is
+        # what this test measures; relying on a semantic embedder made the assertion depend on
+        # whichever optional model happened to be installed on the machine.
+        shared.remember("when the widget crashes, this repo builds with `make all`", project="repo")
+        shared.close()
+
+        secret = "the crash comes from widget_factory.py line 42, a stale cache"
+        stubs = []
+        for i, answer in enumerate((secret, "an unrelated second opinion")):
+            h = cli.make_harness(cwd, provider="mock", model=None, project="packrun-%d" % i)
+            isolate_harness(h, read_project="repo")
+            stub = StubProvider(answer)
+            h.provider = stub
+            stubs.append(stub)
+            h.run("pack%d" % i, "why does the widget crash")
+            h.memory.close()
+            h.recorder.close()      # Windows will not delete a sqlite file that is still open
+
+        second = stubs[1].systems[0]
+        assert secret[:40] not in second, "agent 2 read agent 1's conclusion"
+        assert "make all" in second, "agent 2 lost the shared baseline it should still have"
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for test in tests:
+        if test.__code__.co_argcount == 0:
+            test()
+    print("== PACK ISOLATION: %d test groups passed ==" % len(tests))

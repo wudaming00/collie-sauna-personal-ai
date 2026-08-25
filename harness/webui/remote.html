@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pack — Collie</title>
+<style>
+  :root {
+    color-scheme:light;
+    --bg:#f2eee6; --bg-deep:#e8e0d4; --card:#fffdf9; --soft:#f7f2e9; --strong:#eee6da;
+    --line:rgba(24,35,54,.13); --line-strong:rgba(24,35,54,.22); --ink:#172338; --ink-strong:#101a2c;
+    --dim:#687283; --quiet:#8b93a0; --brand:#203b60; --brand2:#2f527c; --accent:#c8653e;
+    --good:#28765d; --bad:#b34b56; --warn:#a66a22; --focus:#618bc1; --qr:#fff;
+    --shadow:0 18px 44px rgba(41,34,24,.07),0 2px 8px rgba(41,34,24,.04);
+    --shadow-hover:0 22px 54px rgba(41,34,24,.10),0 3px 10px rgba(41,34,24,.05);
+  }
+  * { box-sizing:border-box; }
+  html { min-width:320px; background:var(--bg); }
+  body {
+    min-height:100vh; margin:0; color:var(--ink);
+    font:14px/1.55 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:
+      radial-gradient(circle at 8% -4%,rgba(255,255,255,.92) 0,rgba(255,255,255,0) 31rem),
+      radial-gradient(circle at 102% 10%,rgba(176,135,84,.10) 0,rgba(176,135,84,0) 26rem),var(--bg);
+    -webkit-font-smoothing:antialiased;
+  }
+  button,a { -webkit-tap-highlight-color:transparent; }
+  .wrap { width:min(100%,1280px); margin:0 auto; padding:30px 30px 72px; }
+  .masthead { margin-bottom:28px; padding-bottom:26px; border-bottom:1px solid var(--line); }
+  .masthead-top { display:flex; align-items:center; min-height:30px; margin-bottom:22px; }
+  .back {
+    display:inline-flex; align-items:center; gap:9px; color:var(--dim); text-decoration:none;
+    font-size:12px; font-weight:750; letter-spacing:.025em; transition:color .16s ease,transform .16s ease;
+  }
+  .back::first-letter { color:var(--brand); }
+  .back:hover { color:var(--brand); transform:translateX(-2px); }
+  .titleblock { display:flex; align-items:center; gap:18px; }
+  .titlemark {
+    width:62px; height:62px; display:grid; flex:0 0 auto; place-items:center; border:1px solid var(--line);
+    border-radius:18px; background:rgba(255,253,249,.7); box-shadow:0 10px 26px rgba(41,34,24,.06);
+  }
+  .titlemark img { width:39px; height:39px; object-fit:contain; filter:drop-shadow(0 6px 8px rgba(27,42,66,.13)); }
+  h1 {
+    margin:0; color:var(--ink-strong); font:600 clamp(34px,4.1vw,52px)/.98 ui-serif,"Iowan Old Style",Charter,Georgia,serif;
+    letter-spacing:-.035em;
+  }
+  .sub { max-width:710px; margin:10px 0 0; color:var(--dim); font-size:14px; line-height:1.65; }
+  .deskgrid {
+    display:grid; grid-template-columns:minmax(0,1.5fr) minmax(350px,.82fr);
+    grid-template-areas:"pack remote" "activity remote"; align-items:start; gap:20px;
+  }
+  #packcard { grid-area:pack; }
+  #activitycard { grid-area:activity; }
+  .remote-stack { grid-area:remote; display:grid; gap:16px; min-width:0; }
+  .card {
+    position:relative; min-width:0; padding:24px; overflow:hidden; border:1px solid var(--line);
+    border-radius:20px; background:rgba(255,253,249,.94); box-shadow:var(--shadow);
+  }
+  .card::after {
+    content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.72);
+  }
+  .card > * { position:relative; z-index:1; }
+  .card h2 {
+    display:flex; align-items:center; gap:9px; margin:0 0 20px; color:var(--ink-strong);
+    font-size:11px; font-weight:800; letter-spacing:.105em; line-height:1.2; text-transform:uppercase;
+  }
+  .card h2::before {
+    content:""; width:7px; height:7px; flex:0 0 auto; border-radius:2px; background:var(--accent);
+    box-shadow:0 0 0 4px rgba(200,101,62,.10); transform:rotate(45deg);
+  }
+  #packcard { border-top:3px solid var(--brand); }
+  #activitycard { border-top:3px solid rgba(32,59,96,.48); }
+  #paircard { border-top:3px solid var(--accent); transition:opacity .2s ease; }
+  #paircard.is-disabled { opacity:.62; }
+  .pill {
+    display:inline-flex; align-items:center; gap:7px; min-height:24px; padding:3px 10px; border:1px solid transparent;
+    border-radius:999px; font-size:10px; font-weight:800; letter-spacing:.045em; line-height:1; text-transform:none;
+  }
+  .pill::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 0 3px currentColor; opacity:.7; }
+  .pill.on { color:var(--good); border-color:rgba(40,118,93,.18); background:rgba(40,118,93,.09); }
+  .pill.off { color:var(--bad); border-color:rgba(179,75,86,.18); background:rgba(179,75,86,.09); }
+  .pill.idle { color:var(--warn); border-color:rgba(166,106,34,.19); background:rgba(166,106,34,.10); }
+  .packerr,.activitynotice,.pendingerr { color:var(--bad); font-size:12px; }
+  .packerr:empty,.activitynotice:empty,.pendingerr:empty,.neterr:empty { display:none; }
+  .packerr:not(:empty),.activitynotice:not(:empty),.pendingerr:not(:empty) {
+    margin:-7px 0 17px; padding:9px 11px; border:1px solid rgba(179,75,86,.16); border-radius:10px; background:rgba(179,75,86,.06);
+  }
+  .activitynotice { color:var(--dim); }
+  .activitynotice:not(.bad):not(:empty) { border-color:var(--line); background:var(--soft); }
+  .packidentity {
+    display:flex; align-items:center; gap:15px; margin-bottom:17px; padding:15px; border:1px solid var(--line);
+    border-radius:14px; background:var(--soft);
+  }
+  .packidentity img {
+    width:54px; height:54px; flex:0 0 auto; padding:5px; object-fit:contain; border:1px solid rgba(32,59,96,.11);
+    border-radius:14px; background:var(--card); filter:drop-shadow(0 5px 8px rgba(27,42,66,.12));
+  }
+  .packwho { margin-bottom:2px; color:var(--ink-strong); font-size:16px; font-weight:780; letter-spacing:-.01em; }
+  .packmeta { color:var(--dim); font-size:11px; line-height:1.55; overflow-wrap:anywhere; }
+  .packstats {
+    display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:1px; margin-bottom:17px; overflow:hidden;
+    border:1px solid var(--line); border-radius:14px; background:var(--line);
+  }
+  .packstat { min-width:0; padding:13px 11px 12px; background:var(--card); }
+  .packstat:last-child { background:rgba(200,101,62,.055); }
+  .packstat b { display:block; color:var(--ink-strong); font:730 22px/1.15 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:-.04em; }
+  .packstat span { display:block; margin-top:4px; overflow:hidden; color:var(--dim); font-size:9px; font-weight:760; letter-spacing:.045em; text-overflow:ellipsis; text-transform:uppercase; white-space:nowrap; }
+  .packgrid,.activitygrid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:13px; }
+  .packlane,.activitylane { min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:14px; background:rgba(255,253,249,.52); }
+  .packlane h3,.activitylane h3 {
+    margin:0; padding:11px 13px; border-bottom:1px solid var(--line); background:var(--soft); color:var(--dim);
+    font-size:9px; font-weight:820; letter-spacing:.095em; line-height:1.35; text-transform:uppercase;
+  }
+  .packrows,.activityrows { padding:5px 11px; }
+  .packrow {
+    display:flex; align-items:flex-start; gap:10px; padding:9px 2px; border-bottom:1px solid var(--line); font-size:12px;
+  }
+  .packrow:last-child,.activityrow:last-child { border:0; }
+  .packrowmain,.activitymain { min-width:0; flex:1; }
+  .packrowname,.activityname { color:var(--ink); font-weight:700; overflow-wrap:anywhere; }
+  .packrowmeta,.activitymeta { margin-top:2px; color:var(--dim); font-size:10px; line-height:1.45; overflow-wrap:anywhere; }
+  .packrowstate,.activitystate {
+    flex:none; align-self:start; padding:3px 6px; border-radius:999px; color:var(--good); background:rgba(40,118,93,.08);
+    font:700 9px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:nowrap;
+  }
+  .packrowstate.bad,.activitystate.bad { color:var(--bad); background:rgba(179,75,86,.08); }
+  .activitystate.warn { color:var(--warn); background:rgba(166,106,34,.09); }
+  .packempty,.activityempty,.empty { padding:13px 2px; color:var(--quiet); font-size:11px; }
+  .truthnote {
+    position:relative; margin-top:15px; padding-left:17px; color:var(--dim); font-size:10.5px; line-height:1.55;
+  }
+  .truthnote::before { content:""; position:absolute; top:.55em; left:2px; width:5px; height:5px; border-radius:50%; background:var(--accent); }
+  .activity-title-action { margin-left:auto; padding:6px 10px; font-size:10px; letter-spacing:0; text-transform:none; }
+  .activitylane.full { grid-column:1/-1; }
+  .activityhelp { margin:0; padding:10px 13px 2px; color:var(--dim); font-size:10px; line-height:1.55; }
+  .activityrow {
+    display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; padding:10px 2px; border-bottom:1px solid var(--line); font-size:11px;
+  }
+  .activityactions { grid-column:1/-1; display:flex; flex-wrap:wrap; gap:6px; }
+  .activityactions button { min-height:30px; padding:5px 9px; font-size:10px; }
+  .activitytree { position:relative; margin-left:var(--tree-indent,0); }
+  .activitytree::before { content:""; position:absolute; top:0; bottom:0; left:-8px; width:1px; background:var(--line-strong); }
+  .activitytree.root::before { display:none; }
+  .activitylane-label { padding:10px 2px 4px; color:var(--quiet); font-size:9px; font-weight:820; letter-spacing:.08em; text-transform:uppercase; }
+  .remote-stack .card { padding:21px; border-radius:18px; }
+  .pairgrid { display:grid; grid-template-columns:144px minmax(0,1fr); gap:18px; align-items:start; }
+  .pendcard {
+    grid-column:1/-1; display:grid; place-items:center; gap:7px; margin:0 0 3px; padding:20px;
+    border:1px solid rgba(166,106,34,.28); border-radius:15px; background:rgba(166,106,34,.08); text-align:center;
+  }
+  .pendcard[hidden] { display:none; }
+  .pwho { color:var(--ink-strong); font-size:14px; font-weight:760; }
+  .pnum { color:var(--brand); font:760 38px/1 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.16em; font-variant-numeric:tabular-nums; }
+  .phint { color:var(--dim); font-size:11px; }
+  .prow { display:flex; gap:8px; margin-top:6px; }
+  .prow button { padding:8px 16px; }
+  .pyes { color:#fff; border-color:var(--good); background:var(--good); }
+  .pno { color:var(--dim); background:transparent; }
+  .qr {
+    display:flex; width:144px; height:144px; align-items:center; justify-content:center; padding:9px; overflow:hidden;
+    border:1px solid rgba(24,35,54,.12); border-radius:16px; background:var(--qr); box-shadow:0 8px 24px rgba(35,39,45,.08);
+  }
+  .qr img { width:100%; height:100%; object-fit:contain; }
+  .qr .none { color:#7c8390; font-size:10px; line-height:1.4; text-align:center; }
+  .pairinfo { min-width:0; }
+  .lbl { margin:0 0 6px; color:var(--dim); font-size:10px; line-height:1.5; }
+  .secret-note { margin-top:8px; }
+  .fingerprint-label { margin-top:13px; }
+  .link {
+    min-height:44px; padding:10px 11px; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:10px;
+    background:var(--soft); color:var(--ink); font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;
+  }
+  .code { color:var(--brand); font:750 20px/1.25 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.15em; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:13px; }
+  button {
+    min-height:36px; padding:7px 12px; border:1px solid var(--line-strong); border-radius:10px; background:var(--card);
+    color:var(--ink); font:700 11px/1.25 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    box-shadow:0 1px 2px rgba(27,35,47,.05); cursor:pointer; transition:border-color .16s ease,background .16s ease,box-shadow .16s ease,transform .16s ease;
+  }
+  button:hover { border-color:rgba(32,59,96,.42); background:var(--soft); box-shadow:0 4px 12px rgba(27,35,47,.07); transform:translateY(-1px); }
+  button:active { box-shadow:none; transform:translateY(0); }
+  button.primary { color:#fff; border-color:var(--brand); background:var(--brand); }
+  button.primary:hover { border-color:var(--brand2); background:var(--brand2); }
+  button.danger { color:var(--bad); }
+  button.danger:hover { border-color:rgba(179,75,86,.28); background:rgba(179,75,86,.07); }
+  button:disabled { opacity:.48; cursor:not-allowed; transform:none; }
+  :where(button,a,summary):focus-visible { outline:3px solid rgba(97,139,193,.45); outline-offset:3px; }
+  .neterr {
+    padding:12px 13px; border:1px solid rgba(179,75,86,.22); border-radius:12px; background:rgba(179,75,86,.07); color:var(--bad); font-size:11px;
+  }
+  #offcard { display:none; border-color:rgba(166,106,34,.26); background:rgba(255,249,235,.95); color:var(--warn); font-size:12px; }
+  #offcard .row { margin-top:12px; }
+  .device-card h2 { margin-bottom:10px; }
+  .tablewrap { width:100%; overflow-x:auto; }
+  table { width:100%; min-width:0; border-collapse:collapse; }
+  th,td { padding:11px 6px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; font-size:11px; }
+  tr:last-child td { border-bottom:0; }
+  th { color:var(--quiet); font-size:8px; font-weight:820; letter-spacing:.09em; text-transform:uppercase; }
+  td:first-child { color:var(--ink-strong); font-weight:700; }
+  td.act { text-align:right; white-space:nowrap; }
+  td.act button { min-height:30px; padding:5px 8px; font-size:9px; }
+  .reach { max-width:170px; color:var(--dim); font-size:9.5px; line-height:1.45; }
+  .foot { padding:17px 19px !important; background:rgba(247,242,233,.8); color:var(--dim); font-size:10.5px; box-shadow:none; }
+  .foot code { padding:1px 6px; border-radius:5px; background:var(--strong); }
+  .tech { margin:0 0 11px; padding:0 0 11px; border-bottom:1px solid var(--line); }
+  .tech summary { color:var(--ink); font-size:10.5px; font-weight:750; list-style:none; cursor:pointer; }
+  .tech summary::-webkit-details-marker { display:none; }
+  .tech summary::before { content:"›"; display:inline-block; margin-right:7px; color:var(--accent); transition:transform .15s ease; }
+  .tech[open] summary::before { transform:rotate(90deg); }
+  .techline { margin:9px 0 0 16px; color:var(--dim); font:9.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; }
+  .remote-off-link { color:var(--bad); font-weight:700; text-decoration-color:rgba(179,75,86,.35); text-underline-offset:2px; }
+  .toast {
+    position:fixed; z-index:20; left:50%; bottom:28px; max-width:calc(100vw - 32px); padding:10px 15px;
+    border:1px solid rgba(255,255,255,.12); border-radius:999px; background:#182842; color:#fff; font-size:11px;
+    box-shadow:0 12px 34px rgba(12,21,35,.24); opacity:0; pointer-events:none; transform:translate(-50%,8px); transition:opacity .2s ease,transform .2s ease;
+  }
+  .toast.show { opacity:1; transform:translate(-50%,0); }
+  @media (prefers-color-scheme:dark) {
+    :root {
+      color-scheme:dark; --bg:#0f1722; --bg-deep:#0b111a; --card:#17212e; --soft:#121c28; --strong:#223043;
+      --line:rgba(220,229,239,.12); --line-strong:rgba(220,229,239,.21); --ink:#e8edf2; --ink-strong:#f7f3ec;
+      --dim:#9ca9b9; --quiet:#7d8998; --brand:#a9c0df; --brand2:#496b96; --accent:#df805a;
+      --good:#63bd98; --bad:#ed7d88; --warn:#e0aa64; --focus:#8eb6e8;
+      --shadow:0 18px 46px rgba(0,0,0,.22),0 2px 8px rgba(0,0,0,.16); --shadow-hover:0 24px 56px rgba(0,0,0,.28);
+    }
+    body { background:radial-gradient(circle at 8% -4%,rgba(68,89,116,.24),rgba(68,89,116,0) 30rem),radial-gradient(circle at 102% 12%,rgba(183,102,67,.10),rgba(183,102,67,0) 26rem),var(--bg); }
+    .titlemark,.card,.packlane,.activitylane { background:rgba(23,33,46,.94); }
+    .card::after { box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }
+    .packstat { background:var(--card); }
+    .packstat:last-child { background:rgba(223,128,90,.065); }
+    #offcard { background:rgba(166,106,34,.10); }
+    .foot { background:rgba(18,28,40,.82); }
+  }
+  @media (max-width:1040px) {
+    .wrap { padding-inline:22px; }
+    .deskgrid { grid-template-columns:minmax(0,1fr) minmax(320px,.72fr); }
+    .pairgrid { grid-template-columns:120px minmax(0,1fr); gap:14px; }
+    .qr { width:120px; height:120px; }
+    .card { padding:21px; }
+  }
+  @media (max-width:860px) {
+    .deskgrid { grid-template-columns:minmax(0,1fr); grid-template-areas:"pack" "remote" "activity"; }
+    .remote-stack { grid-template-columns:repeat(2,minmax(0,1fr)); align-items:start; }
+    .remote-stack > .neterr,.remote-stack > #offcard,.remote-stack > #paircard { grid-column:1/-1; }
+    .pairgrid { grid-template-columns:180px minmax(0,1fr); gap:22px; }
+    .qr { width:180px; height:180px; }
+  }
+  @media (max-width:640px) {
+    .wrap { padding:20px 14px 48px; }
+    .masthead { margin-bottom:17px; padding-bottom:20px; }
+    .masthead-top { margin-bottom:16px; }
+    .titleblock { align-items:flex-start; gap:13px; }
+    .titlemark { width:50px; height:50px; border-radius:14px; }
+    .titlemark img { width:31px; height:31px; }
+    h1 { padding-top:2px; font-size:36px; }
+    .sub { margin-top:7px; font-size:12px; }
+    .deskgrid,.remote-stack { gap:13px; }
+    .remote-stack { grid-template-columns:minmax(0,1fr); }
+    .remote-stack > .neterr,.remote-stack > #offcard,.remote-stack > #paircard { grid-column:auto; }
+    .card,.remote-stack .card { padding:18px; border-radius:17px; }
+    .card h2 { margin-bottom:16px; }
+    .packstats { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .packstat:last-child { grid-column:1/-1; }
+    .packgrid,.activitygrid { grid-template-columns:minmax(0,1fr); }
+    .activitylane.full { grid-column:auto; }
+    .pairgrid { grid-template-columns:minmax(0,1fr); }
+    .qr { width:min(180px,100%); height:auto; aspect-ratio:1; justify-self:center; }
+    .pairinfo { width:100%; }
+    .row button { flex:1 1 auto; }
+    .packidentity { align-items:flex-start; }
+    button,.back,.remote-off-link,.tech summary { min-height:44px; display:inline-flex; align-items:center; }
+    .activityactions button,td.act button { min-height:44px; }
+  }
+  @media (max-width:390px) {
+    .packidentity { padding:12px; }
+    .packidentity img { width:46px; height:46px; }
+    .pnum { font-size:32px; }
+  }
+  @media (prefers-reduced-motion:reduce) {
+    *,*::before,*::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <div class="masthead-top">
+      <a class="back" href="/">← <span data-i="Back to Collie">Back to Collie</span></a>
+    </div>
+    <div class="titleblock">
+      <div class="titlemark"><img src="logo.svg" alt="Collie"></div>
+      <div>
+        <h1><span data-i="Pack">Pack</span></h1>
+        <p class="sub" data-i="See which Collies and workers are available, what they are carrying, and which phones can supervise this device.">See which Collies and workers are available, what they are carrying, and which phones can supervise this device.</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="deskgrid">
+    <section class="card" id="packcard">
+      <h2><span data-i="Pack now">Pack now</span> <span id="packhealth" class="pill idle" role="status" aria-live="polite">Loading…</span></h2>
+      <div class="packerr" id="packerr" role="alert" aria-live="assertive"></div>
+      <div class="packidentity">
+        <img id="packavatar" src="/api/avatar.png" alt="">
+        <div>
+          <div class="packwho" id="packwho">Collie</div>
+          <div class="packmeta" id="packdevice">Checking this device…</div>
+          <div class="packmeta" id="packmodel">Checking provider and model…</div>
+        </div>
+      </div>
+      <div class="packstats">
+        <div class="packstat"><b id="statInteractive">—</b><span data-i="Interactive">Interactive</span></div>
+        <div class="packstat"><b id="statMissions">—</b><span data-i="Missions">Missions</span></div>
+        <div class="packstat"><b id="statSpecialists">—</b><span data-i="Specialists">Specialists</span></div>
+        <div class="packstat"><b id="statAutomations">—</b><span data-i="Automations">Automations</span></div>
+        <div class="packstat"><b id="statNeeds">—</b><span data-i="Needs You">Needs You</span></div>
+      </div>
+      <div class="packgrid">
+        <section class="packlane">
+          <h3 data-i="Available here">Available here</h3>
+          <div class="packrows" id="packmembers"><div class="packempty">Loading availability…</div></div>
+        </section>
+        <section class="packlane">
+          <h3 data-i="Active assignments">Active assignments</h3>
+          <div class="packrows" id="packassignments"><div class="packempty">Loading assignments…</div></div>
+        </section>
+      </div>
+      <div class="truthnote" data-i="Worker freshness is reported by local heartbeats. A paired phone is a supervision surface, not another worker.">Worker freshness is reported by local heartbeats. A paired phone is a supervision surface, not another worker.</div>
+    </section>
+
+    <section class="card" id="activitycard">
+      <h2><span data-i="Activity & recovery">Activity &amp; recovery</span><span id="activityhealth" class="pill idle" role="status" aria-live="polite">Loading…</span><button type="button" class="activity-title-action" id="activityRefresh" data-i="Refresh">Refresh</button></h2>
+      <div class="activitynotice" id="activitynotice" role="status" aria-live="polite"></div>
+      <div class="activitygrid">
+        <section class="activitylane">
+          <h3 data-i="Session recovery">Session recovery</h3>
+          <p class="activityhelp" data-i="Inspect the external system before resolving an uncertain action. Collie will not replay it automatically.">Inspect the external system before resolving an uncertain action. Collie will not replay it automatically.</p>
+          <div class="activityrows" id="remoteRecovery"><div class="activityempty" data-i="Loading…">Loading…</div></div>
+        </section>
+        <section class="activitylane">
+          <h3 data-i="Operational activity">Operational activity</h3>
+          <div class="activityrows" id="remoteOtherActivity"><div class="activityempty" data-i="Loading…">Loading…</div></div>
+        </section>
+        <section class="activitylane full">
+          <h3 data-i="Specialist run tree">Specialist run tree</h3>
+          <p class="activityhelp" data-i="Only lifecycle metadata is shown; task content and tool arguments stay private.">Only lifecycle metadata is shown; task content and tool arguments stay private.</p>
+          <div class="activityrows" id="remoteRunTree"><div class="activityempty" data-i="Loading…">Loading…</div></div>
+        </section>
+      </div>
+    </section>
+
+    <aside class="remote-stack" aria-label="Remote supervision" data-i-aria="Remote supervision">
+      <div class="neterr" id="neterr" role="alert" aria-live="assertive"></div>
+
+      <section class="card" id="offcard">
+        <span data-i="Remote is off. Start with collie web --remote, or turn it on below.">Remote is off. Start with collie web --remote, or turn it on below.</span>
+        <div class="row"><button class="primary" id="enableRemote" type="button" data-i="Turn on remote">Turn on remote</button></div>
+      </section>
+
+      <section class="card" id="paircard">
+        <h2><span data-i="Remote supervision">Remote supervision</span> <span id="statuspill" class="pill idle" role="status" aria-live="polite">…</span></h2>
+        <div class="pairgrid">
+          <div class="pendcard" id="pendingbox" role="region" aria-label="Pending pairing request" data-i-aria="Pending pairing request" aria-live="assertive" hidden>
+            <div class="pwho" id="pwho"></div>
+            <div class="pnum" id="pnum"></div>
+            <div class="phint" data-i="Check this matches the number on the phone.">Check this matches the number on the phone.</div>
+            <div class="prow">
+              <button class="pno" id="denyPair" type="button" data-i="Not me">Not me</button>
+              <button class="pyes" id="allowPair" type="button" data-i="Allow">Allow</button>
+            </div>
+          </div>
+          <div class="qr" id="qrbox"><span class="none">—</span></div>
+          <div class="pairinfo">
+            <p class="lbl" data-i="Scan on your phone, or open this link:">Scan on your phone, or open this link:</p>
+            <div class="link" id="link">—</div>
+            <p class="lbl secret-note" data-i="The link fragment contains a one-time secret. It is never sent to the relay and cannot be typed as a login code.">The link fragment contains a one-time secret. It is never sent to the relay and cannot be typed as a login code.</p>
+            <p class="lbl fingerprint-label" data-i="QR fingerprint (display only — not a login code)">QR fingerprint (display only — not a login code)</p>
+            <div class="code" id="code">—</div>
+            <div class="row">
+              <button id="copyPairLink" type="button" data-i="Copy link" disabled>Copy link</button>
+              <button id="rotatePair" type="button" data-i="New pairing QR" disabled>New pairing QR</button>
+            </div>
+          </div>
+        </div>
+        <div class="pendingerr" id="pendingerr" role="alert" aria-live="assertive"></div>
+      </section>
+
+      <section class="card device-card">
+        <h2 data-i="Paired devices">Paired devices</h2>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th data-i="Device">Device</th><th data-i="Paired">Paired</th><th data-i="Reachability">Reachability</th><th></th></tr></thead>
+            <tbody id="devs"><tr><td class="empty" data-i="Loading…" colspan="4">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card foot" id="foot">
+        <details class="tech"><summary data-i="Connection details">Connection details</summary><div class="techline" id="relayline"></div></details>
+        <div><span data-i="Paired devices reconnect automatically after a restart — no need to re-pair.">Paired devices reconnect automatically after a restart — no need to re-pair.</span>
+          <span data-i="Press Ctrl-C or">Press Ctrl-C or</span>
+          <a href="#" class="remote-off-link" id="disableRemote" data-i="turn off remote">turn off remote</a>
+          <span data-i="to cut all remote access instantly.">to cut all remote access instantly.</span></div>
+      </section>
+    </aside>
+  </main>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+var CT = (document.querySelector('meta[name="collie-token"]') || {}).content || "";
+function q(p){ return p + (p.indexOf('?')<0?'?':'&') + 'token=' + encodeURIComponent(CT); }
+
+// ---- i18n: English source strings, translated to the DESKTOP's UI language (settings LANG) ----
+var UI_LANG = "en";
+var SUPPORTED = ["en","zh-tw","zh"];
+function resolveLang(v){ if(v&&v!=="auto"&&SUPPORTED.indexOf(v)>=0) return v;
+  var b=(navigator.language||"").toLowerCase(); for(var i=1;i<SUPPORTED.length;i++) if(b.indexOf(SUPPORTED[i])===0) return SUPPORTED[i]; return "en"; }
+var ZH = {
+  "Back to Collie":"返回 Collie","Pack":"伙伴群","Pack now":"当前伙伴群","See which Collies and workers are available, what they are carrying, and which phones can supervise this device.":"查看当前可用的 Collie 与工作进程、它们承担的任务，以及可以监督本设备的手机。","Connection details":"连接详情",
+  "Interactive":"对话","Missions":"任务","Specialists":"专员","Automations":"自动化","Needs You":"需要你","Available here":"本机可用","Active assignments":"进行中的分工","Worker freshness is reported by local heartbeats. A paired phone is a supervision surface, not another worker.":"工作进程的新鲜度来自本机心跳。已配对手机是监督界面，并不是另一个工作进程。","Remote supervision":"远程监督","Reachability":"可达状态","Paired · live reachability not reported":"已配对 · 未报告实时可达状态",
+  "Control this computer's Collie from your phone. This panel is visible only on this machine; pairing can't be managed from a phone.":"从手机控制这台电脑上的 Collie。此面板只在本机可见，配对无法从手机管理。",
+  "Remote is off. Start with collie web --remote, or turn it on below.":"远程未启用。用 collie web --remote 启动，或点下面的按钮开启。",
+  "Turn on remote":"开启远程","Pairing":"配对","Scan on your phone, or open this link:":"手机扫码，或打开此链接：",
+  "The link fragment contains a one-time secret. It is never sent to the relay and cannot be typed as a login code.":"链接片段内含一次性密钥；它绝不会发送给 relay，也不能作为登录码手动输入。",
+  "QR fingerprint (display only — not a login code)":"二维码指纹（仅供显示——不是登录码）","Copy link":"复制链接","New pairing QR":"生成新配对二维码",
+  "Paired devices":"已配对设备","Device":"设备","Paired":"配对时间","Loading…":"加载中…","Rename":"改备注","Kick":"踢除",
+  "No paired devices yet. Scan the code on your phone to add one.":"还没有已配对的设备。手机扫码即可添加。",
+  "Paired devices reconnect automatically after a restart — no need to re-pair.":"已配对设备在电脑重开后会自动恢复，无需重新配对。",
+  "Press Ctrl-C or":"按 Ctrl-C 或","turn off remote":"关闭远程","to cut all remote access instantly.":"可立即切断所有远程访问。",
+  "Collie Remote":"Collie 远程","On":"在线","Connecting…":"连接中…","Off":"已关闭","Not enabled":"未启用",
+  "Turned on":"已开启","Turned off":"已关闭","Pairing QR updated":"配对二维码已更新","Kicked":"已踢除","Renamed":"已改备注",
+  "Link copied":"链接已复制","Action failed":"操作失败","QR unavailable — use the link below":"二维码暂不可用，用下方链接配对",
+  "Kick this device? It will need to scan again to pair.":"踢除该设备？它需要重新扫码配对。","Device label:":"设备备注：",
+  "relay":"relay","room":"房间","turn":"轮","turns":"轮","Pairing QR code":"配对二维码","Unavailable":"不可用","Available":"可用","Degraded":"部分不可用","Responding":"有响应","Fresh":"新鲜","Stale":"过期","No active assignments.":"没有进行中的分工。",
+  "Could not check pending pairings":"无法检查待处理配对","Could not reach the remote service":"无法连接远程服务",
+  "No pairing link is available yet.":"配对链接尚未可用。","Copy is unavailable; select the link above.":"无法自动复制，请选中上方链接。","Copy failed; select the link above.":"复制失败，请选中上方链接。",
+  "Activity & recovery":"活动与恢复","Refresh":"刷新","Session recovery":"会话恢复","Operational activity":"运行活动","Specialist run tree":"专员运行树",
+  "Inspect the external system before resolving an uncertain action. Collie will not replay it automatically.":"先检查外部系统，再处理不确定操作。Collie 不会自动重放该操作。",
+  "Only lifecycle metadata is shown; task content and tool arguments stay private.":"这里只显示生命周期元数据；任务内容和工具参数保持私密。",
+  "No recovery decisions.":"没有待处理的恢复决定。","No specialist runs.":"没有专员运行。","No other activity.":"没有其他活动。",
+  "Completed":"已完成","Not fired":"未发生","Cancel run":"取消运行","Steer":"补充要求","Cancel":"取消",
+  "Confirm only after inspecting the external system: the action completed.":"请仅在检查外部系统并确认操作已完成后继续。",
+  "Confirm only after inspecting the external system: the action did not fire. Collie may retry safely.":"请仅在检查外部系统并确认操作未发生后继续。Collie 之后可以安全重试。",
+  "Cancel this recovery without replaying the uncertain action?":"要取消此次恢复且不重放不确定操作吗？","Steer this specialist at its next safe boundary:":"在下一个安全边界向该专员补充要求：","Request specialist cancellation?":"要请求取消该专员吗？",
+  "Resolution recorded":"已记录恢复决定","Steer queued":"补充要求已排队","Cancellation requested":"已请求取消","Some operational lanes are unavailable":"部分运行通道暂不可用","Activity is unavailable":"活动暂不可用",
+  "Services":"服务","Service":"服务","Mission":"任务","Automation":"自动化","Queued":"排队中","Running":"运行中","Blocked":"已阻塞","Waiting":"等待中","Paused":"已暂停","Completed status":"已完成","Failed":"失败","Cancel requested":"取消请求中","Cancelled":"已取消","Recovery required":"需要恢复","Workspace required":"需要工作区","Verified against contract":"已按约定验证","Completed without independent verification":"已完成但未独立验证","Review required":"需要审查","Draft":"草稿"
+};
+var ZHTW = {
+  "Activity & recovery":"活動與復原","Refresh":"重新整理","Session recovery":"工作階段復原","Operational activity":"執行活動","Specialist run tree":"專員執行樹",
+  "Inspect the external system before resolving an uncertain action. Collie will not replay it automatically.":"先檢查外部系統，再處理不確定操作。Collie 不會自動重播該操作。",
+  "Only lifecycle metadata is shown; task content and tool arguments stay private.":"這裡只顯示生命週期中繼資料；任務內容和工具參數維持私密。",
+  "No recovery decisions.":"沒有待處理的復原決定。","No specialist runs.":"沒有專員執行。","No other activity.":"沒有其他活動。",
+  "Completed":"已完成","Not fired":"未發生","Cancel run":"取消執行","Steer":"補充要求","Cancel":"取消",
+  "Confirm only after inspecting the external system: the action completed.":"請只在檢查外部系統並確認操作已完成後繼續。",
+  "Confirm only after inspecting the external system: the action did not fire. Collie may retry safely.":"請只在檢查外部系統並確認操作未發生後繼續。Collie 之後可以安全重試。",
+  "Cancel this recovery without replaying the uncertain action?":"要取消此次復原且不重播不確定操作嗎？","Steer this specialist at its next safe boundary:":"在下一個安全邊界向該專員補充要求：","Request specialist cancellation?":"要請求取消該專員嗎？",
+  "Resolution recorded":"已記錄復原決定","Steer queued":"補充要求已排入佇列","Cancellation requested":"已請求取消","Some operational lanes are unavailable":"部分執行通道暫時無法使用","Activity is unavailable":"活動暫時無法使用",
+  "Services":"服務","Service":"服務","Mission":"任務","Automation":"自動化","Queued":"排隊中","Running":"執行中","Blocked":"已封鎖","Waiting":"等待中","Paused":"已暫停","Completed status":"已完成","Failed":"失敗","Cancel requested":"取消請求中","Cancelled":"已取消","Recovery required":"需要復原","Workspace required":"需要工作區","Verified against contract":"已依約定驗證","Completed without independent verification":"已完成但未獨立驗證","Review required":"需要審查","Draft":"草稿"
+}; // falls back to zh where older strings are missing (see t())
+Object.assign(ZH,{
+  "Pending pairing request":"待处理的配对请求","Check this matches the number on the phone.":"请确认此号码与手机上显示的一致。","Not me":"不是我","Allow":"允许",
+  "Unknown OS":"未知操作系统","Repository not reported":"未报告代码库","Device identity unavailable":"设备身份信息不可用","Provider default":"提供方默认设置","Provider and model unavailable":"提供方和模型信息不可用",
+  "Operational lanes":"运行通道","Some Pack state is unavailable":"部分伙伴群状态不可用","This Collie":"当前 Collie","Health endpoint did not respond":"健康检查端点无响应","This device":"本设备","Unknown":"未知",
+  "heartbeat {n}s ago":"心跳 · {n} 秒前","Supervisor":"监督服务","Local coordination service":"本地协调服务","Stopped":"已停止","Not running":"未运行","Assignments unavailable.":"分工信息不可用。","{n} more active assignments":"还有 {n} 条进行中的分工"
+});
+Object.assign(ZHTW,{
+  "Pending pairing request":"待處理的配對請求","Check this matches the number on the phone.":"請確認此號碼與手機上顯示的一致。","Not me":"不是我","Allow":"允許",
+  "Unknown OS":"未知作業系統","Repository not reported":"未回報程式碼庫","Device identity unavailable":"裝置識別資訊無法使用","Provider default":"提供者預設值","Provider and model unavailable":"提供者與模型資訊無法使用",
+  "Operational lanes":"執行通道","Some Pack state is unavailable":"部分夥伴群狀態無法使用","This Collie":"此 Collie","Health endpoint did not respond":"健康檢查端點未回應","This device":"此裝置","Unknown":"未知",
+  "heartbeat {n}s ago":"心跳 · {n} 秒前","Supervisor":"監督服務","Local coordination service":"本機協調服務","Stopped":"已停止","Not running":"未執行","Assignments unavailable.":"分工資訊無法使用。","{n} more active assignments":"還有 {n} 個進行中的分工"
+});
+function t(en){ if(UI_LANG==="zh") return ZH[en]||en; if(UI_LANG==="zh-tw") return ZHTW[en]||ZH[en]||en; return en; }
+function applyStatic(){ document.querySelectorAll("[data-i]").forEach(function(el){ el.textContent=t(el.getAttribute("data-i")); }); document.querySelectorAll("[data-i-aria]").forEach(function(el){el.setAttribute("aria-label",t(el.getAttribute("data-i-aria")));}); document.documentElement.lang=UI_LANG;document.title=t('Pack')+' — Collie'; }
+
+function toast(m){ var el=document.getElementById('toast'); el.textContent=m; el.classList.add('show'); setTimeout(function(){el.classList.remove('show');},1600); }
+function fmt(ts){ if(!ts) return '—'; try{ return new Date(ts*1000).toLocaleString(); }catch(e){ return '—'; } }
+function netError(m){ document.getElementById('neterr').textContent=m||''; }
+function pendingError(m){ document.getElementById('pendingerr').textContent=m||''; }
+function getJson(path,options){return fetch(q(path),options).then(function(r){return r.json().catch(function(){return {};}).then(function(d){if(!r.ok)throw new Error(d.error||d.message||('HTTP '+r.status));return d;});});}
+
+function packRow(parent,name,meta,state,bad){
+  var row=document.createElement('div');row.className='packrow';
+  var main=document.createElement('div');main.className='packrowmain';
+  var title=document.createElement('div');title.className='packrowname';title.textContent=name||'—';main.appendChild(title);
+  if(meta){var sub=document.createElement('div');sub.className='packrowmeta';sub.textContent=meta;main.appendChild(sub);}
+  var status=document.createElement('span');status.className='packrowstate'+(bad?' bad':'');status.textContent=state||t('Unknown');
+  row.appendChild(main);row.appendChild(status);parent.appendChild(row);
+}
+function activeMission(state){return ['queued','running','waiting','needs_you','review_required','recovery_required','reconciling'].indexOf(state)>=0;}
+function activeTask(state){return ['queued','running','blocked','waiting','needs_you','cancel_requested','recovery_required'].indexOf(state)>=0;}
+function activityStateLabel(state){var labels={queued:'Queued',running:'Running',blocked:'Blocked',waiting:'Waiting',needs_you:'Needs You',paused:'Paused',completed:'Completed',succeeded:'Completed',failed:'Failed',dead:'Failed',stopped:'Stopped',missing:'Not running',cancel_requested:'Cancel requested',cancelled:'Cancelled',recovery_required:'Recovery required',workspace_required:'Workspace required',done_verified:'Verified against contract',done_accepted:'Completed without independent verification',review_required:'Review required',draft:'Draft'};return t(labels[state]||String(state||t('Unknown')).replace(/_/g,' '));}
+function activityTone(state){state=String(state||'');if(/failed|dead|cancelled/.test(state))return'bad';if(/needs_you|blocked|waiting|paused|cancel_requested|recovery|required/.test(state))return'warn';return'';}
+function activityNotice(message,bad){var node=document.getElementById('activitynotice');node.textContent=message||'';node.classList.toggle('bad',!!bad);}
+function activityEmpty(parent,message){var empty=document.createElement('div');empty.className='activityempty';empty.textContent=t(message);parent.appendChild(empty);}
+function activityLaneLabel(parent,label){var head=document.createElement('div');head.className='activitylane-label';head.textContent=t(label);parent.appendChild(head);}
+function activityRow(parent,title,meta,state,depth){var row=document.createElement('div');row.className='activityrow'+(depth!=null?' activitytree':'');
+  if(depth!=null){var d=Math.min(Math.max(Number(depth)||0,0),6);row.style.setProperty('--tree-indent',(d*13)+'px');row.classList.toggle('root',d===0);}
+  var main=document.createElement('div');main.className='activitymain';var name=document.createElement('div');name.className='activityname';name.textContent=title||'—';main.appendChild(name);
+  if(meta){var detail=document.createElement('div');detail.className='activitymeta';detail.textContent=meta;main.appendChild(detail);}
+  var status=document.createElement('div');status.className='activitystate '+activityTone(state);status.textContent=activityStateLabel(state);row.appendChild(main);row.appendChild(status);parent.appendChild(row);return row;}
+function activityAction(row,label,className,run){var actions=row.querySelector('.activityactions');if(!actions){actions=document.createElement('div');actions.className='activityactions';row.appendChild(actions);}
+  var button=document.createElement('button');button.type='button';button.textContent=t(label);if(className)button.className=className;button.onclick=function(){var result;
+    try{result=run();}catch(error){activityNotice(t('Action failed')+': '+(error.message||error),true);return;}if(result===false||result==null)return;button.disabled=true;activityNotice('');
+    Promise.resolve(result).then(function(message){toast(t(message));return loadPack();}).catch(function(error){activityNotice(t('Action failed')+': '+(error.message||error),true);}).finally(function(){button.disabled=false;});};actions.appendChild(button);return button;}
+function activityTreeRows(rows){rows=(rows||[]).filter(function(row){return row&&row.run_id;});var all={},keep={};rows.forEach(function(row){all[row.run_id]=row;if(activeTask(row.status))keep[row.run_id]=true;});rows.slice(-24).forEach(function(row){keep[row.run_id]=true;});
+  var changed=true;while(changed){changed=false;Object.keys(keep).forEach(function(id){var row=all[id],parent=row&&row.parent_run_id;if(parent&&all[parent]&&!keep[parent]){keep[parent]=true;changed=true;}});}return rows.filter(function(row){return keep[row.run_id];});}
+function walkActivityTree(rows,visit){var byId={},children={},roots=[],seen={};rows.forEach(function(row){byId[row.run_id]=row;children[row.run_id]=[];});rows.forEach(function(row){var parent=row.parent_run_id;if(parent&&parent!==row.run_id&&byId[parent])children[parent].push(row);else roots.push(row);});
+  function walk(row,depth){if(seen[row.run_id])return;seen[row.run_id]=true;visit(row,depth);(children[row.run_id]||[]).forEach(function(child){walk(child,depth+1);});}roots.forEach(function(row){walk(row,0);});rows.forEach(function(row){walk(row,0);});}
+function renderRemoteRecovery(activity){var box=document.getElementById('remoteRecovery');box.textContent='';var rows=(activity.sessions||[]).filter(function(row){return row.recovery_required;});if(!rows.length){activityEmpty(box,'No recovery decisions.');return;}
+  rows.forEach(function(data){var row=activityRow(box,data.session_id,data.reason||'',data.state);activityAction(row,'Completed','primary',function(){if(!confirm(t('Confirm only after inspecting the external system: the action completed.')))return false;
+      return getJson('/api/recovery/reconcile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({session:data.session_id,resolution:'completed',confirmed:true})}).then(function(){return'Resolution recorded';});});
+    activityAction(row,'Not fired','',function(){if(!confirm(t('Confirm only after inspecting the external system: the action did not fire. Collie may retry safely.')))return false;
+      return getJson('/api/recovery/reconcile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({session:data.session_id,resolution:'not_fired',confirmed:true})}).then(function(){return'Resolution recorded';});});
+    activityAction(row,'Cancel run','danger',function(){if(!confirm(t('Cancel this recovery without replaying the uncertain action?')))return false;
+      return getJson('/api/recovery/reconcile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({session:data.session_id,resolution:'cancel',confirmed:true})}).then(function(){return'Resolution recorded';});});});}
+function renderRemoteRunTree(activity){var box=document.getElementById('remoteRunTree'),rows=activityTreeRows(activity.task_runs||[]);box.textContent='';if(!rows.length){activityEmpty(box,'No specialist runs.');return;}
+  walkActivityTree(rows,function(data,depth){var meta=data.mission_id?t('Mission')+' · '+data.mission_id:'';var row=activityRow(box,(data.role||'specialist')+' · '+data.run_id,meta,data.status,depth);if(activeTask(data.status)){
+      activityAction(row,'Steer','primary',function(){var text=prompt(t('Steer this specialist at its next safe boundary:'),'');if(text==null||!text.trim())return false;return getJson('/api/mission/specialist/steer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run_id:data.run_id,text:text.trim()})}).then(function(){return'Steer queued';});});
+      activityAction(row,'Cancel','danger',function(){if(!confirm(t('Request specialist cancellation?')))return false;return getJson('/api/mission/specialist/cancel',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({run_id:data.run_id})}).then(function(){return'Cancellation requested';});});}});}
+function activityRecent(rows,active,max){var out=(rows||[]).filter(active);(rows||[]).slice(-max).forEach(function(row){if(out.indexOf(row)<0)out.push(row);});return out.slice(-max);}
+function renderRemoteOther(activity,health){var box=document.getElementById('remoteOtherActivity');box.textContent='';var count=0,workers=(health&&health.workers)||{},services=(health&&health.services)||{};
+  var serviceNames={};Object.keys(workers).forEach(function(name){serviceNames[name]=true;});Object.keys(services).forEach(function(name){serviceNames[name]=true;});
+  if(Object.keys(serviceNames).length){activityLaneLabel(box,'Services');Object.keys(serviceNames).sort().forEach(function(name){var worker=workers[name],service=services[name],meta=[];
+      if(worker&&worker.age_s!=null)meta.push(Math.round(worker.age_s)+'s');if(service)meta.push(t('Service'));
+      var state=service&&!service.ok?'failed':worker&&!worker.fresh?'recovery_required':'running';activityRow(box,name,meta.join(' · '),state);count++;});}
+  var missions=activityRecent(activity.missions||[],function(row){return activeMission(row.state);},7);if(missions.length){activityLaneLabel(box,'Missions');missions.forEach(function(data){activityRow(box,data.mission_id,data.lane||t('Mission'),data.state);count++;});}
+  var automations=activityRecent(activity.automations||[],function(row){return activeTask(row.state);},7);if(automations.length){activityLaneLabel(box,'Automations');automations.forEach(function(data){activityRow(box,(data.automation_id||t('Automation'))+' · '+(data.execution_id||'—'),t('Automation'),data.state);count++;});}
+  if(!count)activityEmpty(box,'No other activity.');}
+function renderRemoteActivity(activity,health,failures){var pill=document.getElementById('activityhealth');if(!activity){pill.className='pill off';pill.textContent=t('Unavailable');activityNotice(t('Activity is unavailable'),true);['remoteRecovery','remoteRunTree','remoteOtherActivity'].forEach(function(id){var box=document.getElementById(id);box.textContent='';activityEmpty(box,'Activity is unavailable');});return;}
+  pill.className=health&&health.status==='needs_you'?'pill idle':(health&&health.ok?'pill on':'pill idle');pill.textContent=health?(health.status==='needs_you'?t('Needs You'):(health.ok?t('Available'):t('Degraded'))):t('Available');renderRemoteRecovery(activity);renderRemoteRunTree(activity);renderRemoteOther(activity,health);
+  var issues=(failures||[]).filter(function(name){return name==='activity'||name==='health';}),lanes=Object.keys(activity.errors||{}).concat(Object.keys((health&&health.activity_errors)||{}));if(lanes.length)issues.push(t('Some operational lanes are unavailable')+': '+lanes.join(', '));activityNotice(issues.join(' · '),issues.length>0);}
+function renderPack(parts,failures){
+  var identity=parts.identity||{},caps=parts.capabilities||{},health=parts.health,activity=parts.activity,
+      approvals=parts.approvals, pill=document.getElementById('packhealth');
+  if(!health){pill.className='pill off';pill.textContent=t('Unavailable');}
+  else if(health.status==='needs_you'){pill.className='pill idle';pill.textContent=t('Needs You');}
+  else if(health.ok){pill.className='pill on';pill.textContent=t('Available');}
+  else{pill.className='pill idle';pill.textContent=t('Degraded');}
+  document.getElementById('packwho').textContent=identity.name||'Collie';
+  var packavatar=document.getElementById('packavatar'),avatar=identity.avatar||'/api/avatar.png';
+  if(packavatar.getAttribute('src')!==avatar)packavatar.src=avatar;
+  packavatar.onerror=function(){this.onerror=null;this.src='/logo.svg';};
+  document.getElementById('packdevice').textContent=identity.machine?
+    identity.machine+' · '+(identity.os||t('Unknown OS'))+' · '+(identity.repo||t('Repository not reported')):
+    t('Device identity unavailable');
+  document.getElementById('packmodel').textContent=caps.provider?
+    caps.provider+' · '+(caps.model||t('Provider default')):t('Provider and model unavailable');
+  var work=(health&&health.work)||{};
+  [['statInteractive','interactive_active'],['statMissions','missions_active'],['statSpecialists','task_runs_active'],['statAutomations','automations_active']].forEach(function(pair){
+    document.getElementById(pair[0]).textContent=health?Number(work[pair[1]]||0):'—';
+  });
+  document.getElementById('statNeeds').textContent=approvals?Number((approvals.approvals||[]).length):'—';
+  var messages=(failures||[]).slice();
+  var laneErrors=Object.keys((activity&&activity.errors)||{}).concat(Object.keys((health&&health.activity_errors)||{}));
+  if(laneErrors.length)messages.push(t('Operational lanes')+': '+laneErrors.join(', '));
+  document.getElementById('packerr').textContent=messages.length?t('Some Pack state is unavailable')+': '+messages.join('; ')+'.':'';
+
+  var members=document.getElementById('packmembers');members.textContent='';
+  if(!health){packRow(members,t('This Collie'),t('Health endpoint did not respond'),t('Unavailable'),true);}
+  else{
+    packRow(members,identity.name||t('This Collie'),(identity.machine||t('This device'))+' · v'+(identity.version||t('Unknown')),t('Responding'),false);
+    Object.keys(health.workers||{}).forEach(function(name){var worker=health.workers[name]||{},fresh=worker.fresh===true;
+      packRow(members,name,activityStateLabel(worker.state)+(worker.age_s==null?'':' · '+t('heartbeat {n}s ago').replace('{n}',Math.round(worker.age_s))),t(fresh?'Fresh':'Stale'),!fresh);});
+    var supervisor=health.supervisor||{};
+    if(supervisor.installed)packRow(members,t('Supervisor'),t('Local coordination service'),supervisor.running?t('Responding'):activityStateLabel(supervisor.status||'stopped'),!supervisor.running);
+  }
+
+  var assignments=document.getElementById('packassignments');assignments.textContent='';var rows=[];
+  (activity&&activity.sessions||[]).forEach(function(row){if(activeTask(row.state))rows.push({name:row.session_id,meta:t('Interactive'),state:row.state});});
+  (activity&&activity.missions||[]).forEach(function(row){if(activeMission(row.state))rows.push({name:row.mission_id,meta:t('Mission'),state:row.state});});
+  (activity&&activity.task_runs||[]).forEach(function(row){if(activeTask(row.status))rows.push({name:row.run_id,meta:row.role||'specialist',state:row.status});});
+  (activity&&activity.automations||[]).forEach(function(row){if(activeTask(row.state))rows.push({name:row.automation_id+' · '+row.execution_id,meta:t('Automation'),state:row.state});});
+  rows.slice(0,12).forEach(function(row){packRow(assignments,row.name,row.meta,activityStateLabel(row.state),/failed|stale|recovery/.test(row.state||''));});
+  if(!rows.length){var empty=document.createElement('div');empty.className='packempty';empty.textContent=activity?t('No active assignments.'):t('Assignments unavailable.');assignments.appendChild(empty);}
+  else if(rows.length>12){var more=document.createElement('div');more.className='packempty';more.textContent=t('{n} more active assignments').replace('{n}',rows.length-12);assignments.appendChild(more);}
+  renderRemoteActivity(activity,health,failures);
+}
+function loadPack(){
+  var specs=[['identity','/api/whoami'],['capabilities','/api/run-capabilities'],['health','/api/healthz'],['activity','/api/activity'],['approvals','/api/approvals']];
+  return Promise.all(specs.map(function(spec){return getJson(spec[1]).then(function(value){return {key:spec[0],value:value};})
+    .catch(function(){return {key:spec[0],error:true};});})).then(function(results){var parts={},failures=[];
+      results.forEach(function(result){if(result.error)failures.push(result.key);else parts[result.key]=result.value;});renderPack(parts,failures);});
+}
+
+var LINK = "";
+function render(s){
+  var pill=document.getElementById('statuspill'), off=document.getElementById('offcard'), pc=document.getElementById('paircard');
+  var enabled=!!(s.available&&s.enabled),pairReady=!!(enabled&&s.link);
+  if(!enabled){ pill.className='pill off'; pill.textContent=t(s.available?'Off':'Not enabled'); off.style.display='block'; }
+  else { pill.className=s.connected?'pill on':'pill idle'; pill.textContent=t(s.connected?'On':'Connecting…'); off.style.display='none'; }
+  pc.classList.toggle('is-disabled',!enabled);pc.setAttribute('aria-disabled',enabled?'false':'true');
+  document.getElementById('copyPairLink').disabled=!pairReady;document.getElementById('rotatePair').disabled=!enabled;
+  document.getElementById('allowPair').disabled=!enabled;document.getElementById('denyPair').disabled=!enabled;
+  LINK=pairReady?s.link:"";
+  document.getElementById('link').textContent=pairReady?s.link:'—';
+  document.getElementById('code').textContent=pairReady?(s.paircode||'—'):'—';
+  document.getElementById('relayline').textContent=t('relay')+'：'+(s.relay||'—')+'  ·  '+t('room')+'：'+(s.room||'—');
+  var box=document.getElementById('qrbox');
+  box.textContent='';if(pairReady){ var img=new Image(); img.alt=t('Pairing QR code');img.src=q('/api/remote/qr')+'&v='+Date.now();
+    img.onerror=function(){box.textContent='';var none=document.createElement('span');none.className='none';none.textContent=t('QR unavailable — use the link below');box.appendChild(none);};
+    box.appendChild(img); } else {var dash=document.createElement('span');dash.className='none';dash.textContent='—';box.appendChild(dash);}
+  var tb=document.getElementById('devs'); tb.textContent=''; var ds=s.devices||[];
+  if(!ds.length){var er=document.createElement('tr'),ec=document.createElement('td');ec.className='empty';ec.colSpan=4;ec.textContent=t('No paired devices yet. Scan the code on your phone to add one.');er.appendChild(ec);tb.appendChild(er);return; }
+  ds.forEach(function(d){
+    var tr=document.createElement('tr'),name=document.createElement('td'),paired=document.createElement('td'),reach=document.createElement('td'),acts=document.createElement('td'),ren=document.createElement('button'),del=document.createElement('button');
+    name.textContent=String(d.name||'device');paired.textContent=fmt(d.paired_at);reach.className='reach';reach.textContent=t('Paired · live reachability not reported');acts.className='act';ren.className='ren';ren.textContent=t('Rename');del.className='danger';del.textContent=t('Kick');acts.appendChild(ren);acts.appendChild(document.createTextNode(' '));acts.appendChild(del);tr.appendChild(name);tr.appendChild(paired);tr.appendChild(reach);tr.appendChild(acts);
+    ren.onclick=function(){ renameDev(d.device_id, d.name||''); };
+    del.onclick=function(){ kick(d.device_id); };
+    tb.appendChild(tr);
+  });
+}
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function pollPending(){
+  getJson('/api/remote/pending').then(function(j){
+    var box=document.getElementById('pendingbox');
+    if(!box) return;
+    if(j && j.pending){
+      box.hidden=false;
+      document.getElementById('pnum').textContent=j.pending.num||'';
+      document.getElementById('pwho').textContent=(j.pending.name||t('A device'));
+    } else { box.hidden=true; }
+    pendingError('');
+  }).catch(function(e){pendingError(t('Could not check pending pairings')+': '+e.message);});
+}
+function decide(yes){
+  getJson('/api/remote/'+(yes?'approve':'deny'),{method:'POST'})
+    .then(function(){ document.getElementById('pendingbox').hidden=true;pendingError('');load(); }).catch(function(e){pendingError(t('Action failed')+': '+e.message);});
+}
+function load(){ getJson('/api/remote/status').then(function(d){netError('');render(d);}).catch(function(e){var p=document.getElementById('statuspill');p.className='pill off';p.textContent=t('Unavailable');netError(t('Could not reach the remote service')+': '+e.message);}); }
+function act(a){ getJson('/api/remote/'+a,{method:'POST'}).then(function(){ toast(t({enable:'Turned on',disable:'Turned off',rotate:'Pairing QR updated'}[a]||'OK'));netError('');load(); }).catch(function(e){toast(t('Action failed'));netError(t('Action failed')+': '+e.message);}); }
+function kick(id){ if(!confirm(t('Kick this device? It will need to scan again to pair.'))) return;
+  getJson('/api/remote/forget',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({device_id:id})}).then(function(){ toast(t('Kicked'));netError('');load(); }).catch(function(e){netError(t('Action failed')+': '+e.message);}); }
+function renameDev(id,cur){ var n=prompt(t('Device label:'),cur||''); if(n==null) return;
+  getJson('/api/remote/rename',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({device_id:id,name:n})}).then(function(){ toast(t('Renamed'));netError('');load(); }).catch(function(e){netError(t('Action failed')+': '+e.message);}); }
+function copyLink(){ if(!LINK){netError(t('No pairing link is available yet.'));return;} if(!navigator.clipboard){netError(t('Copy is unavailable; select the link above.'));return;} navigator.clipboard.writeText(LINK).then(function(){ toast(t('Link copied'));netError(''); }).catch(function(){netError(t('Copy failed; select the link above.'));}); }
+
+document.getElementById('enableRemote').addEventListener('click',function(){act('enable');});
+document.getElementById('activityRefresh').addEventListener('click',loadPack);
+document.getElementById('denyPair').addEventListener('click',function(){decide(false);});
+document.getElementById('allowPair').addEventListener('click',function(){decide(true);});
+document.getElementById('copyPairLink').addEventListener('click',copyLink);
+document.getElementById('rotatePair').addEventListener('click',function(){act('rotate');});
+document.getElementById('disableRemote').addEventListener('click',function(e){e.preventDefault();act('disable');});
+
+// resolve the desktop's UI language, then translate + start polling
+fetch(q('/api/settings')).then(function(r){return r.json();}).then(function(d){ UI_LANG=resolveLang(((d||{}).values||{}).LANG); })
+  .catch(function(){ UI_LANG=resolveLang(null); })
+  .finally(function(){ applyStatic(); loadPack(); setInterval(loadPack,4000);load(); setInterval(load,4000);
+                       pollPending(); setInterval(pollPending,1500); });
+</script>
+</body>
+</html>

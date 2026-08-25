@@ -1,0 +1,157 @@
+"""A settings read that fails must not quietly become "nothing was ever saved".
+
+From one conversation that went wrong in a way nobody could see. Seven turns answered normally,
+then `push` came back with canned "Based on the tool output:" text — twice, verbatim — and the
+commit it described had never been pushed. settings.json was correct on disk the whole time and
+the Settings panel reported the right provider throughout.
+
+The path: _load() blanked its cache on ANY read failure while leaving the cached mtime at the
+last good value, so the next call saw an unchanged mtime, skipped the reload, and served {} for
+the rest of the process's life. One transient failure — an atomic panel save racing a reader, a
+scanner holding the file for a moment — latched permanently. apply() then popped every
+COLLIE_<KEY> it had injected, and webapp._provider() answered the way it used to: "mock".
+
+Two independent things had to be true for a fixture to reach a person as an answer. Both are
+tested here: a failed read keeps what it had, and an unconfigured provider refuses instead of
+inventing one.
+"""
+import importlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+fails = []
+
+
+def check(ok, what):
+    print(("  PASS " if ok else "  FAIL ") + what)
+    if not ok:
+        fails.append(what)
+
+
+def _fresh_settings(path):
+    """Import harness.settings pointed at `path`, with COLLIE_PROVIDER absent.
+
+    Absent matters: _HARD_ENV is snapshotted at import, and a var already set there is classed as
+    a user override that apply() must never touch — the opposite of what these cases exercise.
+    """
+    import harness
+    os.environ.pop("COLLIE_PROVIDER", None)
+    os.environ["COLLIE_SETTINGS_PATH"] = path
+    sys.modules.pop("harness.settings", None)
+    if hasattr(harness, "settings"):
+        delattr(harness, "settings")
+    return importlib.import_module("harness.settings")
+
+
+def _boom(_p):
+    raise OSError(13, "locked by another process")
+
+
+def main():
+    tmp = tempfile.mkdtemp(prefix="collie-settings-")
+    path = os.path.join(tmp, "settings.json")
+    old_path_env = os.environ.get("COLLIE_SETTINGS_PATH")
+    old_prov = os.environ.get("COLLIE_PROVIDER")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"PROVIDER": "claude-agent-sdk", "MODEL": "claude-sonnet-5"}, f)
+
+        st = _fresh_settings(path)
+        check(st._load().get("PROVIDER") == "claude-agent-sdk", "a readable settings.json loads")
+
+        legacy_path = os.path.join(tmp, "legacy.json")
+        with open(legacy_path, "w", encoding="utf-8") as f:
+            json.dump({"PROVIDER": "anthropic-oauth", "MODEL": "claude-opus-5"}, f)
+        legacy = _fresh_settings(legacy_path)
+        check(legacy._load().get("PROVIDER") == "claude-agent-sdk"
+              and legacy._load().get("MODEL") == "claude-opus-5",
+              "legacy Claude direct settings migrate to Agent SDK without changing the model")
+
+        # 1. a failed read keeps the last good values instead of blanking them
+        real = os.path.getmtime
+        os.path.getmtime = _boom
+        try:
+            check(st._load().get("PROVIDER") == "claude-agent-sdk",
+                  "a failed read keeps the last good values")
+        finally:
+            os.path.getmtime = real
+
+        # 2. ...and does not latch. The file has NOT changed, so its mtime still matches the one
+        #    cached before the failure — the exact condition under which the old code skipped the
+        #    reload and kept serving {} forever.
+        check(st._load().get("PROVIDER") == "claude-agent-sdk",
+              "and recovers on the next call, with the file untouched")
+
+        # 3. a file that does not exist is a real answer, not a failure
+        st_missing = _fresh_settings(os.path.join(tmp, "nope.json"))
+        check(st_missing._load() == {}, "a missing settings.json is {} (nothing saved yet)")
+
+        # 4. end to end — the step that actually reached the conversation: apply() must not pop
+        #    COLLIE_PROVIDER back to unset because one read blipped.
+        st2 = _fresh_settings(path)
+        st2.apply()
+        check(os.environ.get("COLLIE_PROVIDER") == "claude-agent-sdk",
+              "apply() injects the saved provider")
+        os.path.getmtime = _boom
+        try:
+            st2.apply()
+        finally:
+            os.path.getmtime = real
+        check(os.environ.get("COLLIE_PROVIDER") == "claude-agent-sdk",
+              "and a failed read does not pop it back to unset")
+
+        # 5. the one path that can DELETE settings must not merge into a guess.
+        #    This is the loss as it actually happened, reproduced: the cache empty (a read that
+        #    failed) while the file on disk is complete, and then a panel save of ONE key. update()
+        #    merging into {} is a REPLACE — that is how four saved keys became one, taking the
+        #    provider with them and dropping a live web server onto the mock model mid-conversation.
+        st4 = _fresh_settings(path)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"LANG": "en", "PROVIDER": "claude-agent-sdk",
+                       "MODEL": "claude-sonnet-5", "WALLPAPER": "on"}, f)
+        st4._cache["data"] = {}                      # a first read that failed, on a fresh process:
+        st4._cache["mtime"] = os.path.getmtime(path)  # nothing good to fall back to, and no re-read
+        check(st4._load() == {}, "the poisoned cache really does read as empty")
+
+        st4.update({"LANG": "zh"})                   # the language change that did it
+        back = json.load(open(path, encoding="utf-8"))
+        check(back.get("PROVIDER") == "claude-agent-sdk" and back.get("MODEL") == "claude-sonnet-5"
+              and back.get("WALLPAPER") == "on",
+              "a one-key save does not delete the other three when the cache is empty")
+        check(back.get("LANG") == "zh", "...and still writes the key it was asked to write")
+
+        #    A file that genuinely holds nothing is a different thing, and must still be writable.
+        st5 = _fresh_settings(os.path.join(tmp, "empty.json"))
+        st5.update({"LANG": "zh"})
+        check(json.load(open(os.path.join(tmp, "empty.json"), encoding="utf-8")) == {"LANG": "zh"},
+              "a settings file that does not exist yet is created, not refused")
+
+        # 6. no provider setting means Collie's authenticated-route selector,
+        # never a fixture. Auto itself fails honestly when no provider is usable.
+        from harness import webapp
+        os.environ.pop("COLLIE_PROVIDER", None)
+        check(webapp._provider() == "auto", "_provider() with nothing set selects Auto, not mock")
+        os.environ["COLLIE_PROVIDER"] = "mock"
+        check(webapp._provider() == "mock", "mock is still reachable, by name")
+        os.environ["COLLIE_PROVIDER"] = "anthropic-oauth"
+        check(webapp._provider() == "claude-agent-sdk",
+              "and the removed Claude direct env value migrates to Agent SDK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        for k, v in (("COLLIE_SETTINGS_PATH", old_path_env), ("COLLIE_PROVIDER", old_prov)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    print("\n  " + ("%d FAILED" % len(fails) if fails else "settings fallback: all green"))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

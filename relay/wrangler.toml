@@ -1,0 +1,38 @@
+name = "collie-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+workers_dev = true
+
+# Keep the public desktop default (wss://collie.run) and phone endpoints on the same relay Worker.
+[[routes]]
+pattern = "collie.run/relay/*"
+zone_name = "collie.run"
+
+[[routes]]
+pattern = "collie.run/r/*"
+zone_name = "collie.run"
+
+# Push is part of the production supervision path. Wrangler has no supported "required secret"
+# config field, so worker.js fails every health/Remote route closed until all four encrypted APNs
+# bindings are present and structurally valid. Secret values never belong in this file.
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayRoom"
+
+# Dog liveness is isolated from phone-remote rooms: one PresencePack Durable Object per pack.
+# Provisioning requires a Worker secret (never put it in this file):
+#   npx wrangler secret put PRESENCE_ADMIN_TOKEN
+[[durable_objects.bindings]]
+name = "PRESENCE"
+class_name = "PresencePack"
+
+# SQLite-backed Durable Objects work on the Workers free plan; RelayRoom and PresencePack both use
+# storage for the small pieces of state that must survive hibernation/restart.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayRoom"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PresencePack"]
